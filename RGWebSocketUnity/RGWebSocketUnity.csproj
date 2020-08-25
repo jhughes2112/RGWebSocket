@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <RootNamespace>ReachableGames.RGWebSocketUnity</RootNamespace>
+    <ApplicationIcon>reachablegames.ico</ApplicationIcon>
+    <Copyright>Copyright 2020 Reachable Games LLC</Copyright>
+    <Description>A clean Unity-friendly package that provides a single-threaded simple interface to websockets, based on .NET Standard.</Description>
+    <PackageIcon>reachablegames.png</PackageIcon>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
+    <Platforms>AnyCPU</Platforms>
+
+	<VersionSuffix>1.0.7</VersionSuffix>
+	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
+	<Version>$(VersionSuffix)</Version>
+	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+	<PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+	<PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Company>Reachable Games LLC</Company>
+    <Authors>Jason Hughes</Authors>
+    <DelaySign>false</DelaySign>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Any CPU'">
+    <Optimize>false</Optimize>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Any CPU'">
+    <DefineConstants>TRACE</DefineConstants>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
+    <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
+    <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="reachablegames.png">
+      <Pack>True</Pack>
+      <PackagePath></PackagePath>
+    </None>
+  </ItemGroup>
+
+</Project>

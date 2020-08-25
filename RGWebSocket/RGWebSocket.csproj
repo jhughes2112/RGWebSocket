@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netcoreapp3.1</TargetFramework>
+    <RootNamespace>ReachableGames.RGWebSocket</RootNamespace>
+    <ApplicationIcon>reachablegames.ico</ApplicationIcon>
+    <Copyright>Copyright 2020 Reachable Games LLC</Copyright>
+    <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET Core 3.1, suitable for servers.</Description>
+    <PackageIcon>reachablegames.png</PackageIcon>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
+    <Platforms>AnyCPU</Platforms>
+	
+	<VersionSuffix>1.0.7</VersionSuffix>
+	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
+	<Version>$(VersionSuffix)</Version>
+	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+	<PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Authors>Jason Hughes</Authors>
+    <Company>Reachable Games LLC</Company>
+    <DelaySign>false</DelaySign>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Any CPU'">
+    <Optimize>false</Optimize>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Any CPU'">
+    <WarningLevel>0</WarningLevel>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="publish\**" />
+    <EmbeddedResource Remove="publish\**" />
+    <None Remove="publish\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\CancellationTokenAwaiter.cs" Link="CancellationTokenAwaiter.cs" />
+    <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
+    <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
+    <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
+    <Compile Include="..\WebSocketServer.cs" Link="WebSocketServer.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="reachablegames.png">
+      <Pack>True</Pack>
+      <PackagePath></PackagePath>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Update="Properties\Resources.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

@@ -252,9 +252,11 @@ namespace ReachableGames
 						httpContext.Response.StatusCode = 500;
 						httpContext.Response.Close();
 					}
-					catch (Exception)  // anything else
+					catch // anything else
 					{
 						_logger?.Invoke("WebSocketServer.HandleConnection - websocket upgrade exception", 1);
+						httpContext.Response.StatusCode = 500;
+						httpContext.Response.Close();
 					}
 				}
 				else  // let the application specify what the HTTP response is, but we do the async write here to free up the app to do other things
@@ -268,18 +270,21 @@ namespace ReachableGames
 							httpContext.Response.StatusCode = _httpRequestCallback(httpContext, out buffer);
 							httpContext.Response.ContentLength64 = buffer.Length;
 							await httpContext.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length, responseTimeout.Token);
-							httpContext.Response.Close();
 						}
 					}
 					catch (OperationCanceledException)  // timeout
 					{
-						_logger?.Invoke("WebSocketServer.HandleConnection - normal http response timeout", 1);
+						_logger?.Invoke("WebSocketServer.HandleConnection - http response timeout", 1);
 						httpContext.Response.StatusCode = 500;
-						httpContext.Response.Close();
 					}
-					catch (Exception)  // anything else
+					catch // anything else
 					{
-						_logger?.Invoke("WebSocketServer.HandleConnection - normal http exception", 1);
+						_logger?.Invoke("WebSocketServer.HandleConnection - http callback handler exception", 1);
+						httpContext.Response.StatusCode = 500;
+					}
+					finally
+					{
+						httpContext.Response.Close();
 					}
 				}
 			}

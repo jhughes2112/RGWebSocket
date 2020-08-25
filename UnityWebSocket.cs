@@ -8,6 +8,7 @@ using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Threading.Tasks;
 using System.Threading;
+using System.Collections.Generic;
 
 namespace ReachableGames
 {
@@ -31,6 +32,7 @@ namespace ReachableGames
 
 			private string                  _connectUrl;           // caching the connection params so Reconnect is possible w/o downstream users needing to know the details
 			private int                     _connectTimeoutMS;
+			private Dictionary<string, string> _connectHeaders = new Dictionary<string, string>();
 			public  Status                  _status { get; private set; }
 
 			private RGWebSocket             _rgws;
@@ -75,10 +77,11 @@ namespace ReachableGames
 			}
 
 			// Lets you specify where to connect to.
-			public Task Connect(string url, int connectTimeoutMS)
+			public Task Connect(string url, int connectTimeoutMS, Dictionary<string, string> headers)
 			{
 				_connectUrl = url;
 				_connectTimeoutMS = connectTimeoutMS;
+				_connectHeaders = headers;
 
 				return DoConnection();
 			}
@@ -106,6 +109,12 @@ namespace ReachableGames
 					wsClient = new ClientWebSocket();
 					using (CancellationTokenSource connectTimeout = new CancellationTokenSource(_connectTimeoutMS))
 					{
+						// Apply all the headers that were passed in.
+						foreach (KeyValuePair<string, string> kvp in _connectHeaders)
+						{
+							wsClient.Options.SetRequestHeader(kvp.Key, kvp.Value);
+						}
+
 						_status = Status.Connecting;
 						await wsClient.ConnectAsync(uri, connectTimeout.Token).ConfigureAwait(false);
 					}
