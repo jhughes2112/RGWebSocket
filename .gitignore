@@ -1,0 +1,15 @@
+!**/*.sln
+!**/*.csproj
+**/obj/
+**/.vs/
+**/bin/
+**/Library/
+**/Temp/
+**/Build/
+**/Logs/
+**/*.sln
+**/*.csproj
+**/publish/
+build.bat
+shadow.snk
+*.user
