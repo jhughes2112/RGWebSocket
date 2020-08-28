@@ -193,9 +193,18 @@ namespace ReachableGames
 
 								Close();  // Queue up a close message and tell the send thread to shut down properly and clean up.
 							}
+							catch (System.Net.HttpListenerException ex)
+							{
+								exit = true;
+								if (ex.InnerException != null)
+									_lastError = $"{_displayId} Recv: [{_webSocket.State.ToString()}] {ex.InnerException.Message}";
+								else _lastError = $"{_displayId} Recv: [{_webSocket.State.ToString()}] {ex.Message}";
 
-							// I pulled this out of the try because I do NOT want this code handling exceptions for some random user callbacks.
-							if (recvResult!=null && recvResult.MessageType!=WebSocketMessageType.Close)
+								Close();  // Queue up a close message and tell the send thread to shut down properly and clean up.
+							}
+
+								// I pulled this out of the try because I do NOT want this code handling exceptions for some random user callbacks.
+								if (recvResult!=null && recvResult.MessageType!=WebSocketMessageType.Close)
 							{
 								// assumption is that we don't get a mixture of binary and text for a single message
 								messageBytes.AddRange(new ArraySegment<byte>(_recvBuffer, 0, recvResult.Count));
