@@ -203,8 +203,8 @@ namespace ReachableGames
 								Close();  // Queue up a close message and tell the send thread to shut down properly and clean up.
 							}
 
-								// I pulled this out of the try because I do NOT want this code handling exceptions for some random user callbacks.
-								if (recvResult!=null && recvResult.MessageType!=WebSocketMessageType.Close)
+							// I pulled this out of the try because I do NOT want this code handling exceptions for some random user callbacks.
+							if (recvResult!=null && recvResult.MessageType!=WebSocketMessageType.Close)
 							{
 								// assumption is that we don't get a mixture of binary and text for a single message
 								messageBytes.AddRange(new ArraySegment<byte>(_recvBuffer, 0, recvResult.Count));
