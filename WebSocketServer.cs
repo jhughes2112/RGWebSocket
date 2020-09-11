@@ -23,6 +23,7 @@ namespace ReachableGames
 			public delegate int OnHttpRequest(HttpListenerContext httpContext, out byte[] outBuffer);
 
 			private int                         _listenerThreads;
+			private int                         _idleSeconds;
 			private int                         _connectionMS;
 			private string                      _prefixURL;
 			private OnHttpRequest               _httpRequestCallback;
@@ -42,9 +43,10 @@ namespace ReachableGames
 			private Task                      _cleanupTask;
 
 			// The third parameter makes it possible to easily handle the case where a http connection turns into a websocket by simply handing it back to the caller.
-			public WebSocketServer(int listenerThreads, int connectionMS, string prefixURL, OnHttpRequest httpRequest, Action<string, int> logger, Action<RGWebSocket> websocketConnection, Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect)
+			public WebSocketServer(int listenerThreads, int connectionMS, string prefixURL, OnHttpRequest httpRequest, Action<string, int> logger, Action<RGWebSocket> websocketConnection, Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, int idleSeconds)
 			{
 				_listenerThreads = listenerThreads;
+				_idleSeconds = idleSeconds;
 				_connectionMS = connectionMS;
 				_prefixURL = prefixURL;
 				_httpRequestCallback = httpRequest;
@@ -241,7 +243,7 @@ namespace ReachableGames
 							HttpListenerWebSocketContext webSocketContext = await Task.Run(async () => { return await httpContext.AcceptWebSocketAsync(null).ConfigureAwait(false); }, upgradeTimeout.Token);
 							_logger?.Invoke("WebSocketServer.HandleConnection - websocket detected.  Upgraded.", 1);
 
-							RGWebSocket rgws = new RGWebSocket(_onReceiveMsgText, _onReceiveMsgBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
+							RGWebSocket rgws = new RGWebSocket(_onReceiveMsgText, _onReceiveMsgBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, _idleSeconds);
 							_websockets.TryAdd(rgws._uniqueId, rgws);
 							_websocketConnection(rgws);
 						}

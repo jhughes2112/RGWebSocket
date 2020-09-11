@@ -33,9 +33,12 @@ namespace ReachableGames
 			private SemaphoreSlim           _releaseSendThread;    // this is zero when no messages remain, non-zero when messages need to be sent
 			private Task                    _sendTask;
 			private Task                    _recvTask;
+			private Task                    _idleTask;
 			private CancellationTokenSource _cancellationTokenSource;
 			private string                  _actualLastErr = string.Empty;
 			private byte[]                  _recvBuffer = new byte[kRecvBufferSize];
+			
+			private int                     _idleDisconnectSeconds;  // If no messages are passed either way in _idleDisconnectSeconds, close the connection
 
 			// Basic metrics
 			public int    _uniqueId           { get; private set; }  // typically used by calling program to keep additional state in a dictionary
@@ -58,7 +61,7 @@ namespace ReachableGames
 			// DisplayId is only a human-readable string, uniqueId is generated here but not used internally, and is guaranteed to increment every time a websocket is created, 
 			// and configuration for how to handle when the send is backed up. The cancellation source is a way for the caller to tear down the socket under any circumstances 
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
-			public RGWebSocket(Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket)
+			public RGWebSocket(Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket, int idleDisconnectSeconds)
 			{
 				if (onReceiveMsgTextCb==null || onReceiveMsgBinaryCb==null || onDisconnect==null)
 					throw new Exception("Cannot pass null in for receive callbacks or disconnection callback.");
@@ -73,12 +76,14 @@ namespace ReachableGames
 				_displayId = displayId;
 				_connectedAtTicks = DateTime.UtcNow.Ticks;
 				_webSocket = webSocket;
+				_idleDisconnectSeconds = idleDisconnectSeconds;
 				_uniqueId = Interlocked.Increment(ref _wsUID);
 				_cancellationTokenSource = new CancellationTokenSource();
 
 				_releaseSendThread = new SemaphoreSlim(0, int.MaxValue);  // this is zero when no messages remain, non-zero when messages need to be sent
 				_recvTask = Recv(_cancellationTokenSource.Token);
 				_sendTask = Send(_cancellationTokenSource.Token);
+				_idleTask = Idle(_cancellationTokenSource);
 			}
 
 			// Let the client know when the connection is open for business.  Any other setting we shouldn't be pumping new messages into it.
@@ -88,6 +93,9 @@ namespace ReachableGames
 			public void Close()
 			{
 				Send(sCloseOutputAsync);
+				if (ReadyToSend==false)
+					_logger?.Invoke("Attempting Close but websocket is " + _webSocket==null ? "NULL" : _webSocket.State.ToString(), 0);
+//				Abort(1000);  // make sure things die when they should
 			}
 
 			// Tell the websocket to abort if it does not close on its own in the specified time.  If you aren't certain the socket has disconnected already, call this before calling Shutdown.
@@ -108,8 +116,10 @@ namespace ReachableGames
 				// Final teardown happens here, after the caller has been told of the disconnection.
 				_recvTask?.Dispose();
 				_sendTask?.Dispose();
+				_idleTask?.Dispose();
 				_recvTask = null;
 				_sendTask = null;
+				_idleTask = null;
 
 				_webSocket?.Dispose();
 				_webSocket = null;  // this should never be set to null before here.
@@ -368,6 +378,9 @@ namespace ReachableGames
 				{
 					// This waits a second on the off-chance Send exits due to an exception of some sort and Recv keeps running.
 					await _recvTask;  // make sure recv is exited before we do the disconnect callback.
+					
+					_cancellationTokenSource.Cancel();  // if we don't cancel here, we have to wait for the idle task to completely expire, which isn't ideal.
+					await _idleTask;  // make sure idle is exited too
 				}
 				catch (Exception e)
 				{
@@ -382,6 +395,34 @@ namespace ReachableGames
 
 					double totalSeconds = Math.Max(0.1, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - _connectedAtTicks).TotalSeconds);
 					_logger?.Invoke($"{_displayId} ({finalState.ToString()}) SendExit Recv: {_stats_recvMsgs}/{Utilities.BytesToHumanReadable(_stats_recvBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_recvBytes / totalSeconds))}/s Send: {_stats_sentMsgs}/{Utilities.BytesToHumanReadable(_stats_sentBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_sentBytes / totalSeconds))}/s TotalMsgQTime: {TimeSpan.FromTicks(_stats_msgQueuedTime).TotalSeconds}", 0);
+				}
+			}
+
+			//-------------------
+			// This task simply monitors for messages being sent/received, and if that number doesn't change between delays, trigger the cancellation token.
+			private async Task Idle(CancellationTokenSource tokenSource)
+			{
+				CancellationToken token = tokenSource.Token;  // we use this to allow other threads to kill this task
+
+				try
+				{
+					for (;;)
+					{
+						int sends = _stats_sentMsgs;
+						int recvs = _stats_recvMsgs;
+						await Task.Delay(_idleDisconnectSeconds * 1000, token);
+						if (_stats_sentMsgs == sends && _stats_recvMsgs == recvs)  // this is an idle connection
+							break;
+					}
+					_logger?.Invoke($"{_displayId} Idle connection closed.", 1);
+					Close();
+				}
+				catch (OperationCanceledException)  // not an error, flow control
+				{
+				}
+				catch (Exception e)
+				{
+					_logger?.Invoke($"{_displayId} Idle task: {e.Message}", 0);
 				}
 			}
 		}

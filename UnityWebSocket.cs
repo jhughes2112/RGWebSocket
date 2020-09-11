@@ -34,6 +34,7 @@ namespace ReachableGames
 			private int                     _connectTimeoutMS;
 			private Dictionary<string, string> _connectHeaders = new Dictionary<string, string>();
 			public  Status                  _status { get; private set; }
+			private int                     _idleSeconds;          // if nothing happens in this period of time, disconnect
 
 			private RGWebSocket             _rgws;
 			private Action<string, int>     _logCb;                // if non-null, this passes back logging, the int is 0=basic, 1=noisy, 2=very noisy from the guts of the websocket.  Some performance cost so if you don't need it, leave it null.
@@ -63,10 +64,11 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(Action<string, int> loggerCb = null)
+			public UnityWebSocket(Action<string, int> loggerCb = null, int idleSeconds = 300)
 			{
 				_logCb = loggerCb;
 				_status = Status.ReadyToConnect;
+				_idleSeconds = idleSeconds;
 			}
 
 			// Forcibly disposes the RGWS
@@ -120,7 +122,7 @@ namespace ReachableGames
 					}
 
 					_status = Status.Connected;
-					_rgws = new RGWebSocket(OnRecvTextMsg, OnRecvBinaryMsg, OnDisconnect, _logCb, uri.ToString(), wsClient);
+					_rgws = new RGWebSocket(OnRecvTextMsg, OnRecvBinaryMsg, OnDisconnect, _logCb, uri.ToString(), wsClient, _idleSeconds);
 					_logCb?.Invoke($"UWS Connected to {_connectUrl}", 1);
 				}
 				catch (AggregateException age)
