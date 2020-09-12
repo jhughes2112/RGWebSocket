@@ -122,7 +122,7 @@ namespace ReachableGames
 					}
 
 					_status = Status.Connected;
-					_rgws = new RGWebSocket(OnRecvTextMsg, OnRecvBinaryMsg, OnDisconnect, _logCb, uri.ToString(), wsClient, _idleSeconds);
+					_rgws = new RGWebSocket(null, OnRecvTextMsg, OnRecvBinaryMsg, OnDisconnect, _logCb, uri.ToString(), wsClient, _idleSeconds);
 					_logCb?.Invoke($"UWS Connected to {_connectUrl}", 1);
 				}
 				catch (AggregateException age)

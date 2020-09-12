@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -22,6 +23,7 @@ namespace ReachableGames
 		{
 			// These can be added from any thread, and the main task will handle sending and receiving them, since websockets aren't inherently thread safe, apparently.
 			private ConcurrentQueue<Tuple<string, byte[], long>> _outgoing;
+			private HttpListenerContext            _httpContext;  // must call .Request.Close() to release a bunch of internal tracking data in the .NET lib, otherwise it leaks
 			private WebSocket                      _webSocket;
 			private Action<RGWebSocket, string>    _onReceiveMsgTextCb;
 			private Action<RGWebSocket, byte[]>    _onReceiveMsgBinaryCb;
@@ -61,7 +63,7 @@ namespace ReachableGames
 			// DisplayId is only a human-readable string, uniqueId is generated here but not used internally, and is guaranteed to increment every time a websocket is created, 
 			// and configuration for how to handle when the send is backed up. The cancellation source is a way for the caller to tear down the socket under any circumstances 
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
-			public RGWebSocket(Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket, int idleDisconnectSeconds)
+			public RGWebSocket(HttpListenerContext httpContext, Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket, int idleDisconnectSeconds)
 			{
 				if (onReceiveMsgTextCb==null || onReceiveMsgBinaryCb==null || onDisconnect==null)
 					throw new Exception("Cannot pass null in for receive callbacks or disconnection callback.");
@@ -75,6 +77,7 @@ namespace ReachableGames
 				_logger = onLog;
 				_displayId = displayId;
 				_connectedAtTicks = DateTime.UtcNow.Ticks;
+				_httpContext = httpContext;
 				_webSocket = webSocket;
 				_idleDisconnectSeconds = idleDisconnectSeconds;
 				_uniqueId = Interlocked.Increment(ref _wsUID);
@@ -123,6 +126,9 @@ namespace ReachableGames
 
 				_webSocket?.Dispose();
 				_webSocket = null;  // this should never be set to null before here.
+
+				_httpContext?.Response.Close();
+				_httpContext = null;
 
 				_releaseSendThread?.Dispose();
 				_releaseSendThread = null;

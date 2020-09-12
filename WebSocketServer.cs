@@ -122,6 +122,7 @@ namespace ReachableGames
 
 				if (_listenerUpdateTask != null || _cleanupTask != null)
 				{
+					_listener?.Stop();
 					_listenerRunning?.Cancel();  // cancel the listener task, so the await completes
 					_listenerUpdateTask?.Wait();
 					_cleanupTask?.Wait();
@@ -133,26 +134,45 @@ namespace ReachableGames
 			// Run this thread to make sure connections are always being handled for inbound requests
 			private async Task ListenerUpdate(string prefixURL, int numListenerThreads, CancellationToken token)
 			{
-				List<Task> listenerTasks = new List<Task>(numListenerThreads);
+				HashSet<Task> listenerTasks = new HashSet<Task>(numListenerThreads);
 
 				// Create a local cancellation token source which goes away at the end of this function/task
 				try
 				{
-					// Turn on the webserver
+					// Initialize the listener thread count
+					for (int i=0; i<numListenerThreads; i++)
+					{
+						Task t = _listener?.GetContextAsync();
+						listenerTasks.Add(t);
+						_logger?.Invoke("WebSocketServer.ListenerUpdate - adding listener", 2);
+					}
+
+					// Pump the connections as they come in
 					while (token.IsCancellationRequested==false)
 					{
-						// Populate the task set in a non-concurrent dictionary
-						while (listenerTasks.Count < numListenerThreads)
+						using (Task t = await Task.WhenAny(listenerTasks).ConfigureAwait(false))
 						{
-							Task t = Task<HttpListenerContext>.Run(() => { return _listener?.GetContextAsync(); }, token).ContinueWith(HandleConnection, token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Current);
-							listenerTasks.Add(t);
-							_logger?.Invoke("WebSocketServer.ListenerUpdate - adding listener", 2);
-						}
+							listenerTasks.Remove(t);
 
-						using (Task finished = await Task.WhenAny(listenerTasks).ConfigureAwait(false))  // when a connection listener task is completed, terminate it
-						{
-							listenerTasks.Remove(finished);
-							_logger?.Invoke("WebSocketServer.ListenerUpdate - listener handled", 2);
+							Task<HttpListenerContext> connectTask = t as Task<HttpListenerContext>;
+							if (connectTask != null)
+							{
+								_logger?.Invoke("WebSocketServer.ListenerUpdate - listener handled", 2);
+
+								// replace the listener task that just finished.
+								if (token.IsCancellationRequested == false)
+								{
+									Task newListener = _listener?.GetContextAsync();
+									listenerTasks.Add(newListener);
+								}
+
+								// If the connection was valid, go ahead and handle the request
+								if (connectTask.IsCompletedSuccessfully)
+								{
+									// Actually handle the connection
+									listenerTasks.Add(HandleConnection(connectTask.Result));
+								}
+							}
 						}
 					}
 				}
@@ -166,23 +186,30 @@ namespace ReachableGames
 				finally
 				{
 					_logger?.Invoke("WebSocketServer.ListenerUpdate - disposing listener tasks", 1);
-					for (int i=0; i<listenerTasks.Count; i++)
+
+					// Convert to an array right quick, so we can make sure everything completes
+					Task[] remaining = new Task[listenerTasks.Count];
+					listenerTasks.CopyTo(remaining);
+					listenerTasks.Clear();
+
+					// Wait for each to drain out, so we don't cut off any tasks in progress.
+					for (int i=0; i<remaining.Length; i++)
 					{
+						_logger?.Invoke("WebSocketServer.ListenerUpdate - waiting for "+i+"/"+remaining.Length, 1);
 						try
 						{
-							await listenerTasks[i];  // this should throw an OperationCanceledException
+							await remaining[i].ConfigureAwait(false);
 						}
 						catch (OperationCanceledException)
 						{
 							// expected
 						}
-						catch (Exception e)
+						catch (Exception)
 						{
-							_logger?.Invoke($"WebSocketServer.ListenerUpdate - disposing listener tasks caught unexpected exception {e.Message}", 0);
+							// expected
 						}
-						listenerTasks[i].Dispose();
+						remaining[i].Dispose();
 					}
-					listenerTasks.Clear();
 					_logger?.Invoke("WebSocketServer.ListenerUpdate - listener tasks dead", 1);
 				}
 			}
@@ -196,7 +223,7 @@ namespace ReachableGames
 					// This is done on a different thread from OnDisconnect callback because disposing destroys the Send thread it is called from.
 					while (token.IsCancellationRequested==false)
 					{
-						await _disconnectionCount.WaitAsync(token);
+						await _disconnectionCount.WaitAsync(token).ConfigureAwait(false);
 
 						using (IEnumerator<KeyValuePair<int, RGWebSocket>> iter = _disconnected.GetEnumerator())
 						{
@@ -206,7 +233,7 @@ namespace ReachableGames
 								RGWebSocket rgws;
 								if (_disconnected.TryRemove(uid, out rgws))
 								{
-									await rgws.Shutdown();  // make sure the socket's tasks have all exited
+									await rgws.Shutdown().ConfigureAwait(false);  // make sure the socket's tasks have all exited
 									rgws.Dispose();
 									_logger?.Invoke($"WebSocketServer.CleanupThread - deleted socket {uid}", 2);
 								}
@@ -229,9 +256,8 @@ namespace ReachableGames
 
 			//-------------------
 			// Task: when a connection is requested, depending on whether it's an HTTP request or WebSocket request, do different things.
-			private async Task HandleConnection(Task<HttpListenerContext> listenerContext)
+			private async Task HandleConnection(HttpListenerContext httpContext)
 			{
-				HttpListenerContext httpContext = listenerContext.Result;
 				if (httpContext.Request.IsWebSocketRequest)
 				{
 					// Kick off an async task to upgrade the web socket and do send/recv messaging, but fail if it takes more than a second to finish.
@@ -243,7 +269,7 @@ namespace ReachableGames
 							HttpListenerWebSocketContext webSocketContext = await Task.Run(async () => { return await httpContext.AcceptWebSocketAsync(null).ConfigureAwait(false); }, upgradeTimeout.Token);
 							_logger?.Invoke("WebSocketServer.HandleConnection - websocket detected.  Upgraded.", 1);
 
-							RGWebSocket rgws = new RGWebSocket(_onReceiveMsgText, _onReceiveMsgBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, _idleSeconds);
+							RGWebSocket rgws = new RGWebSocket(httpContext, _onReceiveMsgText, _onReceiveMsgBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, _idleSeconds);
 							_websockets.TryAdd(rgws._uniqueId, rgws);
 							_websocketConnection(rgws);
 						}
@@ -271,7 +297,7 @@ namespace ReachableGames
 							byte[] buffer = null;
 							httpContext.Response.StatusCode = _httpRequestCallback(httpContext, out buffer);
 							httpContext.Response.ContentLength64 = buffer.Length;
-							await httpContext.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length, responseTimeout.Token);
+							await httpContext.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length, responseTimeout.Token).ConfigureAwait(false);
 						}
 					}
 					catch (OperationCanceledException)  // timeout
