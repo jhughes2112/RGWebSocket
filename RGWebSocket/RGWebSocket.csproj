@@ -11,7 +11,7 @@
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 	
-	<VersionSuffix>1.0.9</VersionSuffix>
+	<VersionSuffix>1.0.10</VersionSuffix>
 	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
 	<Version>$(VersionSuffix)</Version>
 	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
@@ -42,6 +42,7 @@
 
   <ItemGroup>
     <Compile Include="..\CancellationTokenAwaiter.cs" Link="CancellationTokenAwaiter.cs" />
+    <Compile Include="..\IConnectionManager.cs" Link="IConnectionManager.cs" />
     <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
     <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />

@@ -30,15 +30,15 @@ namespace ReachableGames
 
 			private ConcurrentQueue<Tuple<string, byte[]>> _incomingMessages = new ConcurrentQueue<Tuple<string, byte[]>>();
 
-			private string                  _connectUrl;           // caching the connection params so Reconnect is possible w/o downstream users needing to know the details
-			private int                     _connectTimeoutMS;
+			private string                     _connectUrl;           // caching the connection params so Reconnect is possible w/o downstream users needing to know the details
+			private int                        _connectTimeoutMS;
 			private Dictionary<string, string> _connectHeaders = new Dictionary<string, string>();
-			public  Status                  _status { get; private set; }
-			private int                     _idleSeconds;          // if nothing happens in this period of time, disconnect
+			public  Status                     _status { get; private set; }
+			private int                        _idleSeconds;          // if nothing happens in this period of time, disconnect
 
-			private RGWebSocket             _rgws;
-			private Action<string, int>     _logCb;                // if non-null, this passes back logging, the int is 0=basic, 1=noisy, 2=very noisy from the guts of the websocket.  Some performance cost so if you don't need it, leave it null.
-			private string                  _lastErrorMsg = string.Empty;
+			private RGWebSocket                _rgws;
+			private Action<string, int>        _logger;
+			private string                     _lastErrorMsg = string.Empty;
 
 			//-------------------
 			// Trivial accessors
@@ -64,9 +64,9 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(Action<string, int> loggerCb = null, int idleSeconds = 300)
+			public UnityWebSocket(Action<string, int> logger, int idleSeconds = 300)
 			{
-				_logCb = loggerCb;
+				_logger = logger;
 				_status = Status.ReadyToConnect;
 				_idleSeconds = idleSeconds;
 			}
@@ -122,25 +122,25 @@ namespace ReachableGames
 					}
 
 					_status = Status.Connected;
-					_rgws = new RGWebSocket(null, OnRecvTextMsg, OnRecvBinaryMsg, OnDisconnect, _logCb, uri.ToString(), wsClient, _idleSeconds);
-					_logCb?.Invoke($"UWS Connected to {_connectUrl}", 1);
+					_rgws = new RGWebSocket(null, OnReceiveText, OnReceiveBinary, OnDisconnect, _logger, uri.ToString(), wsClient, _idleSeconds);
+					_logger($"UWS Connected to {_connectUrl}", 1);
 				}
 				catch (AggregateException age)
 				{
 					if (age.InnerException is OperationCanceledException)
 					{
 						_lastErrorMsg = "Connection timed out.";
-						_logCb?.Invoke(_lastErrorMsg, 0);
+						_logger(_lastErrorMsg, 0);
 					}
 					else if (age.InnerException is WebSocketException)
 					{
 						_lastErrorMsg = ((WebSocketException)age.InnerException).Message;
-						_logCb?.Invoke(_lastErrorMsg, 0);
+						_logger(_lastErrorMsg, 0);
 					}
 					else
 					{
 						_lastErrorMsg = age.Message;
-						_logCb?.Invoke(_lastErrorMsg, 0);
+						_logger(_lastErrorMsg, 0);
 					}
 					wsClient?.Dispose();  // cleanup
 					_status = Status.Disconnected;
@@ -148,7 +148,7 @@ namespace ReachableGames
 				catch (Exception e)
 				{
 					_lastErrorMsg = e.Message;
-					_logCb?.Invoke(_lastErrorMsg, 0);
+					_logger(_lastErrorMsg, 0);
 					wsClient?.Dispose();  // cleanup
 					_status = Status.Disconnected;
 				}
@@ -160,7 +160,7 @@ namespace ReachableGames
 				if (_status==Status.Connected && _rgws!=null && _rgws.ReadyToSend)
 				{
 					_rgws.Close();
-					_logCb?.Invoke("UWS Closed.", 1);
+					_logger("UWS Closed.", 1);
 				}
 			}
 
@@ -171,10 +171,10 @@ namespace ReachableGames
 				{
 					_rgws.Close();
 					_rgws.Abort(1000);
-					await _rgws.Shutdown();
+					await _rgws.Shutdown().ConfigureAwait(false);
 				}
 				Dispose();  // this nulls out _rgws
-				_logCb?.Invoke("UWS shutdown.", 1);
+				_logger("UWS shutdown.", 1);
 				_status = Status.ReadyToConnect;
 			}
 
@@ -184,7 +184,7 @@ namespace ReachableGames
 				if (_status == Status.Connected && _rgws != null && _rgws.ReadyToSend)
 				{
 					_rgws.Send(msg);
-					_logCb?.Invoke($"UWS Sent {msg.Length} bytes", 2);
+					_logger($"UWS Sent {msg.Length} bytes", 2);
 					return true;
 				}
 				return false;
@@ -196,7 +196,7 @@ namespace ReachableGames
 				if (_status == Status.Connected && _rgws != null && _rgws.ReadyToSend)
 				{
 					_rgws.Send(msg);
-					_logCb?.Invoke($"UWS Sent {msg.Length} bytes", 2);
+					_logger($"UWS Sent {msg.Length} bytes", 2);
 					return true;
 				}
 				return false;
@@ -224,23 +224,26 @@ namespace ReachableGames
 
 			//-------------------
 			// Privates.  These calls occur on non-main-threads, so messages get queued up and you POLL them out in the Receive call above on the main thread.
-			private void OnRecvTextMsg(RGWebSocket rgws, string msg)
+			private Task OnReceiveText(RGWebSocket rgws, string msg)
 			{
 				_incomingMessages.Enqueue(new Tuple<string, byte[]>(msg, null));
-				_logCb?.Invoke($"UWS Recv {msg.Length} bytes txt", 2);
+				_logger($"UWS Recv {msg.Length} bytes txt", 2);
+				return Task.CompletedTask;
 			}
 
-			private void OnRecvBinaryMsg(RGWebSocket rgws, byte[] msg)
+			private Task OnReceiveBinary(RGWebSocket rgws, byte[] msg)
 			{
 				_incomingMessages.Enqueue(new Tuple<string, byte[]>(string.Empty, msg));
-				_logCb?.Invoke($"UWS Recv {msg.Length} bytes bin", 2);
+				_logger($"UWS Recv {msg.Length} bytes bin", 2);
+				return Task.CompletedTask;
 			}
 
 			// At this point, it's a done deal.  Both Recv and Send are completed, nothing to synchronize.  This is called by Send after Recv is finished.
-			private void OnDisconnect(RGWebSocket rgws)
+			private Task OnDisconnect(RGWebSocket rgws)
 			{
-				_logCb?.Invoke("UWS Disconnected.", 1);
+				_logger("UWS Disconnected.", 1);
 				_status = Status.Disconnected;
+				return Task.CompletedTask;
 			}
 		}
 	}

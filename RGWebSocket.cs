@@ -23,12 +23,12 @@ namespace ReachableGames
 		{
 			// These can be added from any thread, and the main task will handle sending and receiving them, since websockets aren't inherently thread safe, apparently.
 			private ConcurrentQueue<Tuple<string, byte[], long>> _outgoing;
-			private HttpListenerContext            _httpContext;  // must call .Request.Close() to release a bunch of internal tracking data in the .NET lib, otherwise it leaks
-			private WebSocket                      _webSocket;
-			private Action<RGWebSocket, string>    _onReceiveMsgTextCb;
-			private Action<RGWebSocket, byte[]>    _onReceiveMsgBinaryCb;
-			private Action<RGWebSocket>            _onDisconnectCallback;
-			private Action<string, int>            _logger;
+			private HttpListenerContext             _httpContext;  // must call .Request.Close() to release a bunch of internal tracking data in the .NET lib, otherwise it leaks
+			private WebSocket                       _webSocket;
+			private Func<RGWebSocket, string, Task> _onReceiveMsgTextCb;
+			private Func<RGWebSocket, byte[], Task> _onReceiveMsgBinaryCb;
+			private Func<RGWebSocket, Task>         _onDisconnectCallback;
+			private Action<string, int>             _logger;
 
 			private const int kRecvBufferSize     = 4096; // buffer size for receiving chunks of messages
 
@@ -63,16 +63,18 @@ namespace ReachableGames
 			// DisplayId is only a human-readable string, uniqueId is generated here but not used internally, and is guaranteed to increment every time a websocket is created, 
 			// and configuration for how to handle when the send is backed up. The cancellation source is a way for the caller to tear down the socket under any circumstances 
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
-			public RGWebSocket(HttpListenerContext httpContext, Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket, int idleDisconnectSeconds)
+			public RGWebSocket(HttpListenerContext httpContext, Func<RGWebSocket, string, Task> onReceiveMsgText, Func<RGWebSocket, byte[], Task> onReceiveMsgBinary, Func<RGWebSocket, Task> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket, int idleDisconnectSeconds)
 			{
-				if (onReceiveMsgTextCb==null || onReceiveMsgBinaryCb==null || onDisconnect==null)
+				if (onReceiveMsgText==null || onReceiveMsgBinary==null || onDisconnect==null)
 					throw new Exception("Cannot pass null in for receive callbacks or disconnection callback.");
 				if (webSocket==null)
 					throw new Exception("Cannot pass null in for webSocket.");
+				if (onLog==null)
+					throw new Exception("Cannot pass null in for onLog.");
 
 				_outgoing = new ConcurrentQueue<Tuple<string, byte[], long>>();  // this handles limiting the queue and blocking on main thread for us
-				_onReceiveMsgTextCb = onReceiveMsgTextCb;
-				_onReceiveMsgBinaryCb = onReceiveMsgBinaryCb;
+				_onReceiveMsgTextCb = onReceiveMsgText;
+				_onReceiveMsgBinaryCb = onReceiveMsgBinary;
 				_onDisconnectCallback = onDisconnect;
 				_logger = onLog;
 				_displayId = displayId;
@@ -86,7 +88,8 @@ namespace ReachableGames
 				_releaseSendThread = new SemaphoreSlim(0, int.MaxValue);  // this is zero when no messages remain, non-zero when messages need to be sent
 				_recvTask = Recv(_cancellationTokenSource.Token);
 				_sendTask = Send(_cancellationTokenSource.Token);
-				_idleTask = Idle(_cancellationTokenSource);
+				if (_idleDisconnectSeconds>0)
+					_idleTask = Idle(_cancellationTokenSource);
 			}
 
 			// Let the client know when the connection is open for business.  Any other setting we shouldn't be pumping new messages into it.
@@ -97,7 +100,7 @@ namespace ReachableGames
 			{
 				Send(sCloseOutputAsync);
 				if (ReadyToSend==false)
-					_logger?.Invoke("Attempting Close but websocket is " + _webSocket==null ? "NULL" : _webSocket.State.ToString(), 0);
+					_logger("Attempting Close but websocket is " + _webSocket==null ? "NULL" : _webSocket.State.ToString(), 0);
 //				Abort(1000);  // make sure things die when they should
 			}
 
@@ -144,7 +147,7 @@ namespace ReachableGames
 				if (msg==null)
 				{
 					_lastError = $"{_displayId} Send byte[] is null";
-					_logger?.Invoke(_lastError, 0);
+					_logger(_lastError, 0);
 				}
 				else if (ReadyToSend)
 					SendInternal(new Tuple<string, byte[], long>(string.Empty, msg, DateTime.UtcNow.Ticks));
@@ -157,7 +160,7 @@ namespace ReachableGames
 				if (msg == null)
 				{
 					_lastError = $"{_displayId} Send text string is null";
-					_logger?.Invoke(_lastError, 0);
+					_logger(_lastError, 0);
 				}
 				else if (ReadyToSend)
 					SendInternal(new Tuple<string, byte[], long>(msg, null, DateTime.UtcNow.Ticks));
@@ -205,7 +208,7 @@ namespace ReachableGames
 								if (wse.InnerException!=null)
 									_lastError = $"{_displayId} Recv: [{_webSocket.State.ToString()}] {wse.InnerException.Message}";
 								else _lastError = $"{_displayId} Recv: [{_webSocket.State.ToString()}] {wse.Message}";
-								_logger?.Invoke(_lastError, 1);
+								_logger(_lastError, 1);
 
 								Close();  // Queue up a close message and tell the send thread to shut down properly and clean up.
 							}
@@ -240,11 +243,11 @@ namespace ReachableGames
 									{
 										if (recvResult.MessageType==WebSocketMessageType.Binary)  // assume this doesn't change in the middle of a single message
 										{
-											_onReceiveMsgBinaryCb(this, byteArray);
+											await _onReceiveMsgBinaryCb(this, byteArray).ConfigureAwait(false);
 										}
 										else
 										{
-											_onReceiveMsgTextCb(this, System.Text.Encoding.UTF8.GetString(byteArray));
+											await _onReceiveMsgTextCb(this, System.Text.Encoding.UTF8.GetString(byteArray)).ConfigureAwait(false);
 										}
 									}
 									catch (Exception e)  // handle any random exceptions that come from the logic someone might write.  If we don't do this, it silently swallows the errors and locks the websocket thread forever.
@@ -254,7 +257,7 @@ namespace ReachableGames
 											_lastError = $"{_displayId} Recv: [{_webSocket.State.ToString()}] {e.InnerException.Message}";
 										else
 											_lastError = $"{_displayId} Recv: [{_webSocket.State.ToString()}] {e.Message}";
-										_logger?.Invoke(_lastError, 1);
+										_logger(_lastError, 1);
 
 										Close();  // Queue up a close message and tell the send thread to shut down properly and clean up.
 									}
@@ -307,7 +310,7 @@ namespace ReachableGames
 							{
 								exit = true;
 								_lastError = $"{_displayId} Send: [{_webSocket.State.ToString()}] {wse.Message}";
-								_logger?.Invoke(_lastError, 1);
+								_logger(_lastError, 1);
 							}
 							break;
 						case WebSocketState.Connecting:
@@ -333,7 +336,7 @@ namespace ReachableGames
 							{
 								long deltaTicks = (DateTime.UtcNow.Ticks - msgBytes.Item3);
 								_stats_msgQueuedTime += deltaTicks;  // this is the total time this message was queued
-								_logger?.Invoke($"{_displayId} msg queue time: {TimeSpan.FromTicks(deltaTicks).TotalSeconds}", 2);
+								_logger($"{_displayId} msg queue time: {TimeSpan.FromTicks(deltaTicks).TotalSeconds}", 2);
 
 								try
 								{
@@ -370,7 +373,7 @@ namespace ReachableGames
 								{
 									exit = true;
 									_lastError = $"{_displayId} Send: [{_webSocket.State.ToString()}] {wse.Message}";
-									_logger?.Invoke(_lastError, 1);
+									_logger(_lastError, 1);
 								}
 							}
 							break;
@@ -383,24 +386,25 @@ namespace ReachableGames
 				try
 				{
 					// This waits a second on the off-chance Send exits due to an exception of some sort and Recv keeps running.
-					await _recvTask;  // make sure recv is exited before we do the disconnect callback.
+					await _recvTask.ConfigureAwait(false);  // make sure recv is exited before we do the disconnect callback.
 					
 					_cancellationTokenSource.Cancel();  // if we don't cancel here, we have to wait for the idle task to completely expire, which isn't ideal.
-					await _idleTask;  // make sure idle is exited too
+					if (_idleTask!=null)
+						await _idleTask.ConfigureAwait(false);  // make sure idle is exited too
 				}
 				catch (Exception e)
 				{
-					_logger?.Invoke($"Exception shutting down Send thread. {e.Message}", 0);
+					_logger($"Exception shutting down Send thread. {e.Message}", 0);
 				}
 				finally  // must make sure we call _onDisconnectCallback, otherwise it's an infinite loop waiting for send threads to tear down
 				{
 					WebSocketState finalState = _webSocket != null ? _webSocket.State : WebSocketState.None;
 
 					// Let the program know this socket is dead -- note this is on the Send thread, NOT main thread!!!
-					_onDisconnectCallback(this);
+					await _onDisconnectCallback(this).ConfigureAwait(false);
 
 					double totalSeconds = Math.Max(0.1, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - _connectedAtTicks).TotalSeconds);
-					_logger?.Invoke($"{_displayId} ({finalState.ToString()}) SendExit Recv: {_stats_recvMsgs}/{Utilities.BytesToHumanReadable(_stats_recvBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_recvBytes / totalSeconds))}/s Send: {_stats_sentMsgs}/{Utilities.BytesToHumanReadable(_stats_sentBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_sentBytes / totalSeconds))}/s TotalMsgQTime: {TimeSpan.FromTicks(_stats_msgQueuedTime).TotalSeconds}", 0);
+					_logger($"{_displayId} ({finalState.ToString()}) SendExit Recv: {_stats_recvMsgs}/{Utilities.BytesToHumanReadable(_stats_recvBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_recvBytes / totalSeconds))}/s Send: {_stats_sentMsgs}/{Utilities.BytesToHumanReadable(_stats_sentBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_sentBytes / totalSeconds))}/s TotalMsgQTime: {TimeSpan.FromTicks(_stats_msgQueuedTime).TotalSeconds}", 0);
 				}
 			}
 
@@ -416,11 +420,11 @@ namespace ReachableGames
 					{
 						int sends = _stats_sentMsgs;
 						int recvs = _stats_recvMsgs;
-						await Task.Delay(_idleDisconnectSeconds * 1000, token);
+						await Task.Delay(_idleDisconnectSeconds * 1000, token).ConfigureAwait(false);
 						if (_stats_sentMsgs == sends && _stats_recvMsgs == recvs)  // this is an idle connection
 							break;
 					}
-					_logger?.Invoke($"{_displayId} Idle connection closed.", 1);
+					_logger($"{_displayId} Idle connection closed.", 1);
 					Close();
 				}
 				catch (OperationCanceledException)  // not an error, flow control
@@ -428,7 +432,7 @@ namespace ReachableGames
 				}
 				catch (Exception e)
 				{
-					_logger?.Invoke($"{_displayId} Idle task: {e.Message}", 0);
+					_logger($"{_displayId} Idle task: {e.Message}", 0);
 				}
 			}
 		}
