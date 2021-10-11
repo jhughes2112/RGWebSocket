@@ -4,14 +4,14 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <RootNamespace>ReachableGames.RGWebSocketUnity</RootNamespace>
     <ApplicationIcon>reachablegames.ico</ApplicationIcon>
-    <Copyright>Copyright 2020 Reachable Games LLC</Copyright>
+    <Copyright>Copyright 2021 Reachable Games LLC</Copyright>
     <Description>A clean Unity-friendly package that provides a single-threaded simple interface to websockets, based on .NET Standard.</Description>
     <PackageIcon>reachablegames.png</PackageIcon>
     <SignAssembly>true</SignAssembly>
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 
-	<VersionSuffix>1.0.10</VersionSuffix>
+	<VersionSuffix>1.0.11</VersionSuffix>
 	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
 	<Version>$(VersionSuffix)</Version>
 	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>

@@ -39,6 +39,7 @@ namespace ReachableGames
 			private RGWebSocket                _rgws;
 			private Action<string, int>        _logger;
 			private string                     _lastErrorMsg = string.Empty;
+			private Action<UnityWebSocket>     _disconnectCallback;
 
 			//-------------------
 			// Trivial accessors
@@ -64,9 +65,10 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(Action<string, int> logger, int idleSeconds = 300)
+			public UnityWebSocket(Action<string, int> logger, Action<UnityWebSocket> disconnectCallback, int idleSeconds = 300)
 			{
 				_logger = logger;
+				_disconnectCallback = disconnectCallback;
 				_status = Status.ReadyToConnect;
 				_idleSeconds = idleSeconds;
 			}
@@ -184,7 +186,7 @@ namespace ReachableGames
 				if (_status == Status.Connected && _rgws != null && _rgws.ReadyToSend)
 				{
 					_rgws.Send(msg);
-					_logger($"UWS Sent {msg.Length} bytes", 2);
+					_logger($"UWS Sent {msg.Length} bytes", 3);
 					return true;
 				}
 				return false;
@@ -196,7 +198,7 @@ namespace ReachableGames
 				if (_status == Status.Connected && _rgws != null && _rgws.ReadyToSend)
 				{
 					_rgws.Send(msg);
-					_logger($"UWS Sent {msg.Length} bytes", 2);
+					_logger($"UWS Sent {msg.Length} bytes", 3);
 					return true;
 				}
 				return false;
@@ -227,14 +229,14 @@ namespace ReachableGames
 			private Task OnReceiveText(RGWebSocket rgws, string msg)
 			{
 				_incomingMessages.Enqueue(new Tuple<string, byte[]>(msg, null));
-				_logger($"UWS Recv {msg.Length} bytes txt", 2);
+				_logger($"UWS Recv {msg.Length} bytes txt", 3);
 				return Task.CompletedTask;
 			}
 
 			private Task OnReceiveBinary(RGWebSocket rgws, byte[] msg)
 			{
 				_incomingMessages.Enqueue(new Tuple<string, byte[]>(string.Empty, msg));
-				_logger($"UWS Recv {msg.Length} bytes bin", 2);
+				_logger($"UWS Recv {msg.Length} bytes bin", 3);
 				return Task.CompletedTask;
 			}
 
@@ -243,6 +245,7 @@ namespace ReachableGames
 			{
 				_logger("UWS Disconnected.", 1);
 				_status = Status.Disconnected;
+				_disconnectCallback?.Invoke(this);
 				return Task.CompletedTask;
 			}
 		}
