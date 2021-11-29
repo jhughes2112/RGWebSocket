@@ -336,7 +336,7 @@ namespace ReachableGames
 							{
 								long deltaTicks = (DateTime.UtcNow.Ticks - msgBytes.Item3);
 								_stats_msgQueuedTime += deltaTicks;  // this is the total time this message was queued
-								_logger($"{_displayId} msg queue time: {TimeSpan.FromTicks(deltaTicks).TotalSeconds}", 2);
+								_logger($"{_displayId} msg queue time: {TimeSpan.FromTicks(deltaTicks).TotalSeconds}", 3);
 
 								try
 								{
