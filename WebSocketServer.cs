@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using System.Net.WebSockets;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Nito.AsyncEx;
 
 namespace ReachableGames
 {
@@ -24,60 +25,48 @@ namespace ReachableGames
 			public delegate Task OnHttpRequest(HttpListenerContext httpContext);
 
 			private int                       _listenerThreads;
-			private int                       _idleSeconds;
+			private TimeSpan                  _idleSeconds;
 			private int                       _connectionMS;
 			private string                    _prefixURL;
 			private OnHttpRequest             _httpRequestCallback;
 			private Action<string, int>       _logger;
 			private IConnectionManager        _connectionManager;
 
-			private CancellationTokenSource   _listenerRunning;     // if this is non-null, the listener thread is running
-			private Task                      _listenerUpdateTask;  // sleeps until one of the listeners finishes its work, then it creates a new one.  When _isRunning goes false, this exits.
-			private HttpListener              _listener;            // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Stop() on this, they all abort.
-			private ConcurrentDictionary<int, RGWebSocket> _websockets;  // these are live connections
-			private ConcurrentDictionary<int, RGWebSocket> _disconnected;  // the disconnection callback moves them from _websockets to _disconnected
+			private Task                      _listenerUpdateTask = null;      // sleeps until one of the listeners finishes its work, then it creates a new one.  When _isRunning goes false, this exits.
+			private HttpListener              _listener = null;  // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Stop() on this, they all abort.
+			private ConcurrentDictionary<int, RGWebSocket> _websockets   = new ConcurrentDictionary<int, RGWebSocket>();  // these are live connections
+			private LockingList<RGWebSocket>  _disconnected = new LockingList<RGWebSocket>();     // the disconnection callback moves them from _websockets to _disconnected
 			
-			private SemaphoreSlim             _disconnectionCount;
-			private Task                      _cleanupTask;
+			private AsyncAutoResetEvent       _cleanupSocket = new AsyncAutoResetEvent();  // Whenever this is triggered, there's at least one websocket to clean up
+			private CancellationTokenSource   _cleanupRunning = null;
+			private Task                      _cleanupTask = null;
 
-			// The third parameter makes it possible to easily handle the case where a http connection turns into a websocket by simply handing it back to the caller.
-			public WebSocketServer(int listenerThreads, int connectionMS,int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, Action<string, int> logger)
+			// httpRequest callback allows you to handle ordinary non-websocket HTTP requests however you want, even at the same url
+			public WebSocketServer(int listenerThreads, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, Action<string, int> logger)
 			{
 				if (logger==null)
 					throw new Exception("Logger may not be null.");
 				if (connectionManager == null)
 					throw new Exception("ConnectionManager may not be null.");
 				_listenerThreads = listenerThreads;
-				_idleSeconds = idleSeconds;
+				_idleSeconds = TimeSpan.FromSeconds(idleSeconds);  // This is actually the duration between keepalive messages automatically sent by websocket library.
 				_connectionMS = connectionMS;
 				_prefixURL = prefixURL;
 				_httpRequestCallback = httpRequest;
-				_connectionManager = connectionManager;
 				_logger = logger;
+				_connectionManager = connectionManager;
 
-				_listenerRunning = null;
-				_listenerUpdateTask = null;
 				_listener = new HttpListener();
-				_listener.Prefixes.Add(prefixURL);
-				_websockets = new ConcurrentDictionary<int, RGWebSocket>();
-				_disconnected = new ConcurrentDictionary<int, RGWebSocket>();
+				_listener.Prefixes.Add(_prefixURL);
+				_listener.TimeoutManager.IdleConnection = _idleSeconds;  // idle connections are cut after this long
 			}
 
 			public void Dispose()
 			{
-				_logger("WebSocketServer.Dispose - shutting down HttpListener, aborting all websockets", 1);
-				if (_listener!=null && _listener.IsListening)
-					_listener?.Stop();  // this sets all WebSocket statuses = ABORTED.  However, this causes ObjectDisposedException when it doesn't Start properly.
-				_listener?.Close();
-				_listener = null;
-				_listenerRunning?.Dispose();
-				_listenerRunning = null;
-				_listenerUpdateTask?.Dispose();
-				_listenerUpdateTask = null;
-				_cleanupTask?.Dispose();
-				_cleanupTask = null;
-				_disconnectionCount?.Dispose();
-				_disconnectionCount = null;
+				_logger($"WebSocketServer.Dispose - shutting down HttpListener, aborting all websockets (Still Listening? {_listener.IsListening})", 2);
+				if (_listener.IsListening)
+					StopListening();
+				_listener.Close();
 			}
 
 			public void StartListening()
@@ -86,52 +75,48 @@ namespace ReachableGames
 				try
 				{
 					_listener.Start();
+					_listenerUpdateTask = ListenerUpdate(_listenerThreads);
+					_cleanupRunning = new CancellationTokenSource();  // have to create this on StartListening, otherwise if it was ever cancelled it would always be cancelled
+					_cleanupTask = CleanupThread(_cleanupRunning.Token);  // since RGWebSocket can't dispose of itself, we do it out here in a single thread that handles cleanup
+					_logger("WebSocketServer.Start", 2);
 				}
 				catch (HttpListenerException e)
 				{
 					_logger($"WebSocketServer.StartListening exception (usually port conflict) {e.ErrorCode} {e.Message}", 0);
 					throw;  // rethrow it, there's nothing we can do here
 				}
-				_listenerRunning = new CancellationTokenSource();
-				_disconnectionCount = new SemaphoreSlim(0, 100000);
-				_listenerUpdateTask = ListenerUpdate(_prefixURL, _listenerThreads, _listenerRunning.Token);
-				_cleanupTask = CleanupThread(_listenerRunning.Token);
-				_logger("WebSocketServer.Start", 1);
 			}
 
 			// Blocks until the listener thread is torn down.  This ABORTS current connections.
-			public void StopListening(int milliseconds)
+			public void StopListening()
 			{
-				_logger("WebSocketServer.StopListening", 1);
-				while (_websockets.Count>0)  // stay here until all the sockets are closed or ripped down
+				_logger("WebSocketServer.StopListening", 2);
+				_listener.Stop();  // this sets all WebSocket statuses = ABORTED.  However, this causes ObjectDisposedException when it doesn't Start properly.
+				_listenerUpdateTask.Wait();
+				_listenerUpdateTask.Dispose();
+				_listenerUpdateTask = null;
+
+				foreach (KeyValuePair<int, RGWebSocket> kvp in _websockets)  // tell all the websockets to close, now that we aren't accepting any new ones
 				{
-					foreach (int uid in _websockets.Keys)
-					{
-						RGWebSocket rgws;
-						if (_websockets.TryGetValue(uid, out rgws))
-						{
-							rgws.Close();
-							rgws.Abort(milliseconds);  // force close after a brief delay
-						}
-					}
+					kvp.Value.Close();
 				}
 				while (_websockets.Count > 0 || _disconnected.Count > 0)
 					Thread.Yield();
-				Console.Out.WriteLine("All connections closed and disposed.");
 
-				if (_listenerUpdateTask != null || _cleanupTask != null)
-				{
-					_listener?.Stop();
-					_listenerRunning?.Cancel();  // cancel the listener task, so the await completes
-					_listenerUpdateTask?.Wait();
-					_cleanupTask?.Wait();
-				}
-				_logger("WebSocketServer.StopListening completed", 1);
+				// Now that all the websockets are shutdown and disposed of, kill the cleanup task
+				_cleanupRunning.Cancel();
+				_cleanupTask.Wait();
+				_cleanupRunning.Dispose();  // once CleanupTask is finished, we can dispose of this cancellation token source.
+				_cleanupRunning = null;
+				_cleanupTask.Dispose();
+				_cleanupTask = null;
+
+				_logger("WebSocketServer.StopListening completed", 2);
 			}
 
 			//-------------------
-			// Run this thread to make sure connections are always being handled for inbound requests
-			private async Task ListenerUpdate(string prefixURL, int numListenerThreads, CancellationToken token)
+			// Run this thread to make sure connections are always being handled for inbound requests.  By taking in members as parameters, they are not going to go null on us if the Dispose() call happens.
+			private async Task ListenerUpdate(int numListenerThreads)
 			{
 				HashSet<Task> listenerTasks = new HashSet<Task>(numListenerThreads);
 
@@ -141,27 +126,29 @@ namespace ReachableGames
 					// Initialize the listener thread count
 					for (int i=0; i<numListenerThreads; i++)
 					{
-						Task t = _listener?.GetContextAsync();
+						Task<HttpListenerContext> t = _listener.GetContextAsync();
 						listenerTasks.Add(t);
-						_logger("WebSocketServer.ListenerUpdate - adding listener", 2);
+						_logger("WebSocketServer.ListenerUpdate - adding listener", 3);
 					}
 
-					// Pump the connections as they come in
-					while (token.IsCancellationRequested==false)
+					while (_listener.IsListening)  // loop forever until canceled
 					{
 						using (Task t = await Task.WhenAny(listenerTasks).ConfigureAwait(false))
 						{
 							listenerTasks.Remove(t);
 
+							// Note, listenerTasks is used for BOTH listening and for tasks that run for websockets and regular HTTP requests
+							// Which is why sometimes it is a Task<HttpListenerContext> and sometimes is just a regular Task that needs to be disposed when it completes.
+							// That's also why we don't want to add new listener tasks except when the task /was/ a listener that just completed.  Otherwise the number of listener tasks will grow.
 							Task<HttpListenerContext> connectTask = t as Task<HttpListenerContext>;
 							if (connectTask != null)
 							{
-								_logger("WebSocketServer.ListenerUpdate - listener handled", 2);
+								_logger($"WebSocketServer.ListenerUpdate - listener handled {connectTask.Status}", 3);
 
-								// replace the listener task that just finished.
-								if (token.IsCancellationRequested == false)
+								// replace the listener task that just finished if the socket listener is still running
+								if (_listener.IsListening)
 								{
-									Task newListener = _listener?.GetContextAsync();
+									Task newListener = _listener.GetContextAsync();
 									listenerTasks.Add(newListener);
 								}
 
@@ -184,60 +171,77 @@ namespace ReachableGames
 				}
 				finally
 				{
-					_logger("WebSocketServer.ListenerUpdate - disposing listener tasks", 1);
+					_logger("WebSocketServer.ListenerUpdate - disposing listener tasks", 3);
 
-					// Convert to an array right quick, so we can make sure everything completes
-					Task[] remaining = new Task[listenerTasks.Count];
-					listenerTasks.CopyTo(remaining);
-					listenerTasks.Clear();
-
-					// Wait for each to drain out, so we don't cut off any tasks in progress.
-					for (int i=0; i<remaining.Length; i++)
+					int count = listenerTasks.Count;
+					int i = 0;
+					foreach (Task t in listenerTasks)
 					{
-						_logger("WebSocketServer.ListenerUpdate - waiting for "+i+"/"+remaining.Length, 1);
-						try
+						// Wait for each to drain out, so we don't cut off any tasks in progress.
+						i++;
+						_logger($"WebSocketServer.ListenerUpdate - waiting for {i}/{count}", 3);
+						using (t)
 						{
-							await remaining[i].ConfigureAwait(false);
+							try
+							{
+								CancellationTokenSource timeout = new CancellationTokenSource(1000);
+								await t.WaitAsync(timeout.Token).ConfigureAwait(false);  // let each open handler a second to complete its work.  Listeners should already be in Faulted status and return immediately.
+							}
+							catch  // eat any exceptions--we don't really care
+							{
+							}
 						}
-						catch (OperationCanceledException)
-						{
-							// expected
-						}
-						catch (Exception)
-						{
-							// expected
-						}
-						remaining[i].Dispose();
 					}
-					_logger("WebSocketServer.ListenerUpdate - listener tasks dead", 1);
+					_logger("WebSocketServer.ListenerUpdate - listener tasks dead", 3);
 				}
 			}
 
-			// Run this thread to make sure connections are always being handled for inbound requests
+			// Run this thread to make sure connections are always being handled for inbound requests.
 			private async Task CleanupThread(CancellationToken token)
 			{
 				try
 				{
-					// this spins until there are no more sockets to dispose of.  
-					// This is done on a different thread from OnDisconnect callback because disposing destroys the Send thread it is called from.
-					while (token.IsCancellationRequested==false)
+					// This is done on a different thread from OnDisconnect callback because disposing destroys the Send thread at the same time while it's running from there.
+					List<RGWebSocket> toDisconnect = new List<RGWebSocket>();
+					for (;;)
 					{
-						await _disconnectionCount.WaitAsync(token).ConfigureAwait(false);
+						await _cleanupSocket.WaitAsync(token).ConfigureAwait(false);  // this throws OperationCanceledException when it's time to cancel the thread
 
-						using (IEnumerator<KeyValuePair<int, RGWebSocket>> iter = _disconnected.GetEnumerator())
+						// Move this locked structure's content into our local one so we can use async/await on it.  That doesn't mix well with lock() calls.
+						_disconnected.MoveTo(toDisconnect);
+						foreach (RGWebSocket rgws in toDisconnect)
 						{
-							if (iter.MoveNext())  // get the first element of the collection
+							if (_websockets.TryRemove(rgws._uniqueId, out _))  // don't try to delete the RGWS until it's completed its constructor and been fully added to the tracking structures.  Sometimes threads get out of order on startup and the socket is dead due to timeouts before it is ever alive.
 							{
-								int uid = iter.Current.Key;  // there should always be at least one
-								RGWebSocket rgws;
-								if (_disconnected.TryRemove(uid, out rgws))
+								try
 								{
-									await rgws.Shutdown().ConfigureAwait(false);  // make sure the socket's tasks have all exited
-									rgws.Dispose();
-									_logger($"WebSocketServer.CleanupThread - deleted socket {uid}", 2);
+									await _connectionManager.OnDisconnect(rgws).ConfigureAwait(false);  // let the connection manager know it's disconnected now
+								}
+								catch (Exception e)
+								{
+									_logger($"ConnectionManager.OnDisconnect Exception: {rgws._displayId} {e.Message}", 0);
+								}
+								finally
+								{
+									_logger($"CleanupThread: Disposing {rgws._displayId}", 3);
+									try
+									{
+										rgws.Shutdown();  // give C# scheduler just a moment to transition tasks status from "running" to "completed", because it always looks completed in the debugger with a breakpoint here.
+										rgws.Dispose();
+									}
+									catch (Exception e)
+									{
+										_logger($"CleanupThread: Exception {rgws._displayId} {e.Message}", 0);
+									}
 								}
 							}
+							else  // it's too early to destroy this RGWS, it's still in its constructor.  Just put it back and wait until next time.  Order doesn't matter, they're just being destroyed.
+							{
+								_logger($"Spinlooping {rgws._displayId}", 3);
+								_disconnected.Add(rgws);
+							}
 						}
+						toDisconnect.Clear();
 					}
 				}
 				catch (OperationCanceledException)  // if the token is cancelled, we pop to here
@@ -249,7 +253,7 @@ namespace ReachableGames
 				}
 				finally
 				{
-					_logger("WebSocketServer.CleanupThread - exit", 1);
+					_logger("WebSocketServer.CleanupThread - exit", 2);
 				}
 			}
 
@@ -264,71 +268,68 @@ namespace ReachableGames
 					// Kick off an async task to upgrade the web socket and do send/recv messaging, but fail if it takes more than a second to finish.
 					try
 					{
-						_logger("WebSocketServer.HandleConnection - websocket detected.  Upgrading connection.", 1);
+						_logger("WebSocketServer.HandleConnection - websocket detected.  Upgrading connection.", 2);
 						using (CancellationTokenSource upgradeTimeout = new CancellationTokenSource(timeoutMS))
 						{
-							HttpListenerWebSocketContext webSocketContext = await Task.Run(async () => { return await httpContext.AcceptWebSocketAsync(null).ConfigureAwait(false); }, upgradeTimeout.Token);
-							_logger("WebSocketServer.HandleConnection - websocket detected.  Upgraded.", 1);
+							HttpListenerWebSocketContext webSocketContext = await Task.Run(async () => { return await httpContext.AcceptWebSocketAsync(null, _idleSeconds).ConfigureAwait(false); }, upgradeTimeout.Token);
+							_logger("WebSocketServer.HandleConnection - websocket detected.  Upgraded.", 3);
 
-							// Note, we hook our own OnDisconnect before proxying it on to the ConnectionManager.
-							RGWebSocket rgws = new RGWebSocket(httpContext, _connectionManager.OnReceiveText, _connectionManager.OnReceiveBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, _idleSeconds);
+							// Note, we hook our own OnDisconnect before proxying it on to the ConnectionManager.  Note, due to heavy congestion and C# scheduling, it's entirely possible that this is already a closed socket, and is immediately flagged for destruction.
+							RGWebSocket rgws = new RGWebSocket(httpContext, _connectionManager.OnReceiveText, _connectionManager.OnReceiveBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
 							_websockets.TryAdd(rgws._uniqueId, rgws);
 							await _connectionManager.OnConnection(rgws).ConfigureAwait(false);
+							_logger($"WebSocketServer.HandleConnection - websocket detected.  Upgrade completed. {rgws._displayId}", 3);
 						}
 					}
-					catch (OperationCanceledException)  // timeout
+					catch (OperationCanceledException ex)  // timeout
 					{
-						_logger("WebSocketServer.HandleConnection - websocket upgrade timeout", 1);
+						_logger($"WebSocketServer.HandleConnection - websocket upgrade timeout {ex.Message}", 0);
 						httpContext.Response.StatusCode = 500;
-						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
+						httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
 					}
-					catch // anything else
+					catch (Exception ex)// anything else
 					{
-						_logger("WebSocketServer.HandleConnection - websocket upgrade exception", 1);
+						_logger($"WebSocketServer.HandleConnection - websocket upgrade exception {ex.Message}", 0);
 						httpContext.Response.StatusCode = 500;
-						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
+						httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
 					}
 				}
 				else  // let the application specify what the HTTP response is, but we do the async write here to free up the app to do other things
 				{
 					try
 					{
-						_logger("WebSocketServer.HandleConnection - normal http request", 1);
+						_logger($"WebSocketServer.HandleConnection - normal http request {httpContext.Request.RawUrl}", 3);
 						using (CancellationTokenSource responseTimeout = new CancellationTokenSource(timeoutMS))
 						{
 							// Remember to set httpContext.Response.StatusCode, httpContext.Response.ContentLength64, and httpContenxtResponse.OutputStream
 							await _httpRequestCallback(httpContext).ConfigureAwait(false);
 						}
 					}
-					catch (OperationCanceledException)  // timeout
+					catch (OperationCanceledException ex)  // timeout
 					{
-						_logger("WebSocketServer.HandleConnection - http response timeout", 1);
+						_logger($"WebSocketServer.HandleConnection - websocket upgrade timeout {ex.Message}", 0);
 						httpContext.Response.StatusCode = 500;
-						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
+//						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
 					}
-					catch // anything else
+					catch (Exception ex) // anything else
 					{
-						_logger("WebSocketServer.HandleConnection - http callback handler exception", 1);
+						_logger($"WebSocketServer.HandleConnection - http callback handler exception {ex.Message}", 0);
 						httpContext.Response.StatusCode = 500;
-						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
+//						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
 					}
 					finally
 					{
-						httpContext.Response.Close();
+						httpContext.Response.Close();  // This frees all the memory associated with this connection.
 					}
 				}
 			}
 
-			// We capture the callback so we can manage the websocket set internally.
-			private async Task OnDisconnection(RGWebSocket rgws)
+			// Add this websocket to the list of those we need to remove and unblock the cleanup thread
+			private void OnDisconnection(RGWebSocket rgws)
 			{
-				RGWebSocket ws;
-				if (_websockets.TryRemove(rgws._uniqueId, out ws))
-				{
-					_disconnected.TryAdd(rgws._uniqueId, rgws);
-					_disconnectionCount.Release();
-					await _connectionManager.OnDisconnect(rgws).ConfigureAwait(false);  // let the connection manager know it's disconnected now
-				}
+				_logger($"{rgws._displayId} OnDisconnection call.", 3);
+				_disconnected.Add(rgws);  // finally, put it on the list of things to be disposed of
+				_cleanupSocket.Set();  // Let the Cleanup process know there's something to do
 			}
 		}
 	}

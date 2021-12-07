@@ -4,7 +4,6 @@
 //-------------------
 
 using System;
-using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Threading.Tasks;
 using System.Threading;
@@ -28,7 +27,13 @@ namespace ReachableGames
 				Disconnected
 			}
 
-			private ConcurrentQueue<Tuple<string, byte[]>> _incomingMessages = new ConcurrentQueue<Tuple<string, byte[]>>();
+			// Supports strings or binary messages on the websocket.  If binMsg is null, it's a string.
+			public struct wsMessage
+			{
+				public string stringMsg;
+				public byte[] binMsg;
+			}
+			private LockingList<wsMessage>     _incomingMessages = new LockingList<wsMessage>();
 
 			private string                     _connectUrl;           // caching the connection params so Reconnect is possible w/o downstream users needing to know the details
 			private int                        _connectTimeoutMS;
@@ -36,7 +41,7 @@ namespace ReachableGames
 			public  Status                     _status { get; private set; }
 			private int                        _idleSeconds;          // if nothing happens in this period of time, disconnect
 
-			private RGWebSocket                _rgws;
+			private RGWebSocket                _rgws;  // This should only be non-null when _status==Connected.
 			private Action<string, int>        _logger;
 			private string                     _lastErrorMsg = string.Empty;
 			private Action<UnityWebSocket>     _disconnectCallback;
@@ -65,11 +70,12 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(Action<string, int> logger, Action<UnityWebSocket> disconnectCallback, int idleSeconds = 300)
+			public UnityWebSocket(Action<string, int> logger, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS, int idleSeconds)
 			{
 				_logger = logger;
 				_disconnectCallback = disconnectCallback;
 				_status = Status.ReadyToConnect;
+				_connectTimeoutMS = connectTimeoutMS;
 				_idleSeconds = idleSeconds;
 			}
 
@@ -81,10 +87,9 @@ namespace ReachableGames
 			}
 
 			// Lets you specify where to connect to.
-			public Task Connect(string url, int connectTimeoutMS, Dictionary<string, string> headers)
+			public Task Connect(string url, Dictionary<string, string> headers)
 			{
 				_connectUrl = url;
-				_connectTimeoutMS = connectTimeoutMS;
 				_connectHeaders = headers;
 
 				return DoConnection();
@@ -111,6 +116,7 @@ namespace ReachableGames
 				try
 				{
 					wsClient = new ClientWebSocket();
+					wsClient.Options.KeepAliveInterval = Timeout.InfiniteTimeSpan;  // disable the keepalive ping/pong on websocket protocol
 					using (CancellationTokenSource connectTimeout = new CancellationTokenSource(_connectTimeoutMS))
 					{
 						// Apply all the headers that were passed in.
@@ -124,8 +130,8 @@ namespace ReachableGames
 					}
 
 					_status = Status.Connected;
-					_rgws = new RGWebSocket(null, OnReceiveText, OnReceiveBinary, OnDisconnect, _logger, uri.ToString(), wsClient, _idleSeconds);
-					_logger($"UWS Connected to {_connectUrl}", 1);
+					_rgws = new RGWebSocket(null, OnReceiveText, OnReceiveBinary, OnDisconnect, _logger, uri.ToString(), wsClient);
+					_logger($"UWS Connected to {uri}", 1);
 				}
 				catch (AggregateException age)
 				{
@@ -166,16 +172,15 @@ namespace ReachableGames
 				}
 			}
 
-			// A simple blocking way to make sure this is all torn down: Shutdown().Wait()
-			public async Task Shutdown()
+			// A simple blocking way to make sure this is all torn down.
+			public void Shutdown()
 			{
 				if (_rgws!=null)
 				{
-					_rgws.Close();
-					_rgws.Abort(1000);
-					await _rgws.Shutdown().ConfigureAwait(false);
+					_rgws.Shutdown();
+					_rgws.Dispose();
+					_rgws = null;
 				}
-				Dispose();  // this nulls out _rgws
 				_logger("UWS shutdown.", 1);
 				_status = Status.ReadyToConnect;
 			}
@@ -204,49 +209,36 @@ namespace ReachableGames
 				return false;
 			}
 
-			// This is intended for you to pump it until you get a false back.  This juggles all 
-			// the messages from the Recv task thread back to whatever thread you want them on.
-			public bool Receive(Action<string> textMessageCb, Action<byte[]> binaryMessageCb)
+			// This is intended for you to grab all the messages that have been sent, in bulk and from the main thread, like in an MonoBehaviour.Update() method.
+			public void ReceiveAll(List<wsMessage> messageList)
 			{
-				Tuple<string, byte[]> recvMsg;
-				if (_incomingMessages.TryDequeue(out recvMsg))
-				{
-					if (string.IsNullOrEmpty(recvMsg.Item1))
-					{
-						binaryMessageCb(recvMsg.Item2);
-					}
-					else
-					{
-						textMessageCb(recvMsg.Item1);
-					}
-					return true;
-				}
-				return false;  // nothing there
+				// Take the whole set of incoming messages, lock it, then move it to messageList and clear it out
+				_incomingMessages.MoveTo(messageList);
 			}
 
 			//-------------------
 			// Privates.  These calls occur on non-main-threads, so messages get queued up and you POLL them out in the Receive call above on the main thread.
 			private Task OnReceiveText(RGWebSocket rgws, string msg)
 			{
-				_incomingMessages.Enqueue(new Tuple<string, byte[]>(msg, null));
+				_incomingMessages.Add(new wsMessage() { stringMsg = msg, binMsg = null });
 				_logger($"UWS Recv {msg.Length} bytes txt", 3);
 				return Task.CompletedTask;
 			}
 
 			private Task OnReceiveBinary(RGWebSocket rgws, byte[] msg)
 			{
-				_incomingMessages.Enqueue(new Tuple<string, byte[]>(string.Empty, msg));
+				_incomingMessages.Add(new wsMessage() { stringMsg = string.Empty, binMsg = msg });
 				_logger($"UWS Recv {msg.Length} bytes bin", 3);
 				return Task.CompletedTask;
 			}
 
-			// At this point, it's a done deal.  Both Recv and Send are completed, nothing to synchronize.  This is called by Send after Recv is finished.
-			private Task OnDisconnect(RGWebSocket rgws)
+			// At this point, it's a done deal.  Both Recv and Send are completed, nothing to synchronize.  This is called at the bottom of the Send thread after Recv is completed.
+			// However, it is possible that the Recv/Send threads shutdown before the RGWS constructor is even finished 
+			private void OnDisconnect(RGWebSocket rgws)
 			{
 				_logger("UWS Disconnected.", 1);
 				_status = Status.Disconnected;
-				_disconnectCallback?.Invoke(this);
-				return Task.CompletedTask;
+				_disconnectCallback?.Invoke(this);  // This callback needs to NOT modify any tracking structures, because it may be called as early as DURING the RGWS constructor.  Just set flags
 			}
 		}
 	}
