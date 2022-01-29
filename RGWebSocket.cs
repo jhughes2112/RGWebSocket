@@ -25,8 +25,8 @@ namespace ReachableGames
 			private LockingList<QueuedSendMsg>      _outgoing = new LockingList<QueuedSendMsg>();  // this handles limiting the queue and blocking on main thread for us
 			private HttpListenerContext             _httpContext;  // must call .Request.Close() to release a bunch of internal tracking data in the .NET lib, otherwise it leaks
 			private WebSocket                       _webSocket;
-			private Func<RGWebSocket, string, Task> _onReceiveMsgTextCb;
-			private Func<RGWebSocket, byte[], Task> _onReceiveMsgBinaryCb;
+			private Func<RGWebSocket, string, Task>      _onReceiveMsgTextCb;
+			private Func<RGWebSocket, PooledArray, Task> _onReceiveMsgBinaryCb;
 			private Action<RGWebSocket>             _onDisconnectionCb;      // this must run straight through and NOT touch any tracking structures the RGWS might be added to.  This maybe called DURING the constructor!
 			private Action<string, int>             _logger;
 
@@ -54,21 +54,21 @@ namespace ReachableGames
 			static private volatile int _wsUID = 1;
 
 			// when we want to close, we push this through Send() so it knows to initiate closure.  Can be static because it's a sentinel, and compared by address.
-			static private byte[] sCloseOutputAsync = new byte[1];  
+			static private PooledArray sCloseOutputAsync = PooledArray.BorrowFromPool(1);
 
 			// Helpful struct, reduces allocations for simple tracking
 			private struct QueuedSendMsg
 			{
-				public string textMsg;
-				public byte[] binMsg;
-				public long   enqueuedTick;
+				public string      textMsg;
+				public PooledArray binMsg;
+				public long        enqueuedTick;
 			}
 
 			// Constructor takes different callbacks to handle the text/binary message and disconnection (which is called IN the send thread, not main thread).
 			// DisplayId is only a human-readable string, uniqueId is generated here but not used internally, and is guaranteed to increment every time a websocket is created, 
 			// and configuration for how to handle when the send is backed up. The cancellation source is a way for the caller to tear down the socket under any circumstances 
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
-			public RGWebSocket(HttpListenerContext httpContext, Func<RGWebSocket, string, Task> onReceiveMsgText, Func<RGWebSocket, byte[], Task> onReceiveMsgBinary, Action<RGWebSocket> onDisconnectionCb, Action<string, int> onLog, string displayId, WebSocket webSocket)
+			public RGWebSocket(HttpListenerContext httpContext, Func<RGWebSocket, string, Task> onReceiveMsgText, Func<RGWebSocket, PooledArray, Task> onReceiveMsgBinary, Action<RGWebSocket> onDisconnectionCb, Action<string, int> onLog, string displayId, WebSocket webSocket)
 			{
 				if (onReceiveMsgText==null || onReceiveMsgBinary==null || onDisconnectionCb==null)
 					throw new Exception("Cannot pass null in for callbacks.");
@@ -139,8 +139,8 @@ namespace ReachableGames
 			}
 
 			// Thread-friendly way to send any message to the remote client.
-			//***** Note, this does pin the incoming byte[] until it's sent.  Should use a pool of byte[] buffers or derive a buffer that has an IDispose
-			public void Send(byte[] msg)
+			// Note, this does pin the incoming msg until it's sent, which is why it's pooled.
+			public void Send(PooledArray msg)
 			{
 				if (msg==null)
 				{
@@ -168,7 +168,8 @@ namespace ReachableGames
 			// Implementation details below this line
 			private void SendInternal(QueuedSendMsg msg)
 			{
-				_outgoing.Add(msg);  // this automatically locks the queue on add/remove
+				msg.binMsg?.IncRef();      // because this is being queued, we don't want to let the caller reap the buffer yet
+				_outgoing.Add(msg);        // this automatically locks the queue on add/remove
 				_releaseSendThread.Set();  // unlock the send thread since there's work for it to do
 			}
 
@@ -238,31 +239,34 @@ namespace ReachableGames
 										_stats_recvBytes += messageBytes.Count;
 
 										// Tell the application about the message, then reset the buffer and keep going.
-										byte[] byteArray = messageBytes.ToArray();  // has to do an alloc and full buffer copy for ToArray()
-										messageBytes.Clear();
-
-										try
+										using (PooledArray byteArray = PooledArray.BorrowFromPool(messageBytes.Count))  // avoid new allocations, instead try to pull from a known-size pool of messages
 										{
-											if (recvResult.MessageType==WebSocketMessageType.Binary)  // assume this doesn't change in the middle of a single message
-											{
-												await _onReceiveMsgBinaryCb(this, byteArray).ConfigureAwait(false);
-											}
-											else
-											{
-												await _onReceiveMsgTextCb(this, System.Text.Encoding.UTF8.GetString(byteArray)).ConfigureAwait(false);
-											}
-										}
-//										catch (WebSocketException wse)
-										catch (Exception e)  // handle any random exceptions that come from the logic someone might write.  If we don't do this, it silently swallows the errors and locks the websocket thread forever.
-										{
-											exit = true;
-											if (e.InnerException != null)
-												_lastError = $"{_displayId} Recv: [{_webSocket.State}] {e.InnerException.Message}";
-											else
-												_lastError = $"{_displayId} Recv: [{_webSocket.State}] {e.Message}";
-											_logger(_lastError, 0);
+											messageBytes.CopyTo(0, byteArray.data, 0, messageBytes.Count);
+											messageBytes.Clear();
 
-											Abort();  // Tear down the socket
+											try
+											{
+												if (recvResult.MessageType==WebSocketMessageType.Binary)  // assume this doesn't change in the middle of a single message
+												{
+													await _onReceiveMsgBinaryCb(this, byteArray).ConfigureAwait(false);
+												}
+												else
+												{
+													await _onReceiveMsgTextCb(this, System.Text.Encoding.UTF8.GetString(byteArray.data)).ConfigureAwait(false);
+												}
+											}
+//											catch (WebSocketException wse)
+											catch (Exception e)  // handle any random exceptions that come from the logic someone might write.  If we don't do this, it silently swallows the errors and locks the websocket thread forever.
+											{
+												exit = true;
+												if (e.InnerException != null)
+													_lastError = $"{_displayId} Recv: [{_webSocket.State}] {e.InnerException.Message}";
+												else
+													_lastError = $"{_displayId} Recv: [{_webSocket.State}] {e.Message}";
+												_logger(_lastError, 0);
+
+												Abort();  // Tear down the socket
+											}
 										}
 									}
 								}
@@ -341,17 +345,20 @@ namespace ReachableGames
 										}
 										else
 										{
-											if (qsm.binMsg.Equals(sCloseOutputAsync))  // we want to close
+											using (qsm.binMsg)  // drops the refcount by one after this block
 											{
-												await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "", token).ConfigureAwait(false);
-											}
-											else
-											{
-												await _webSocket.SendAsync(new ArraySegment<byte>(qsm.binMsg), WebSocketMessageType.Binary, true, token).ConfigureAwait(false);
+												if (qsm.binMsg.Equals(sCloseOutputAsync))  // we want to close
+												{
+													await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "", token).ConfigureAwait(false);
+												}
+												else
+												{
+													await _webSocket.SendAsync(new ArraySegment<byte>(qsm.binMsg.data, 0, qsm.binMsg.Length), WebSocketMessageType.Binary, true, token).ConfigureAwait(false);
 						
-												// keep stats
-												_stats_sentMsgs++;
-												_stats_sentBytes += qsm.binMsg.Length;
+													// keep stats
+													_stats_sentMsgs++;
+													_stats_sentBytes += qsm.binMsg.Length;
+												}
 											}
 										}
 									}

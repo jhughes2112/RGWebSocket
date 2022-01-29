@@ -30,8 +30,8 @@ namespace ReachableGames
 			// Supports strings or binary messages on the websocket.  If binMsg is null, it's a string.
 			public struct wsMessage
 			{
-				public string stringMsg;
-				public byte[] binMsg;
+				public string      stringMsg;
+				public PooledArray binMsg;
 			}
 			private LockingList<wsMessage>     _incomingMessages = new LockingList<wsMessage>();
 
@@ -198,7 +198,7 @@ namespace ReachableGames
 			}
 
 			// Returns false if data could not be sent (eg. you aren't connected or in a good status to do so)
-			public bool Send(byte[] msg)
+			public bool Send(PooledArray msg)
 			{
 				if (_status == Status.Connected && _rgws != null && _rgws.ReadyToSend)
 				{
@@ -210,6 +210,7 @@ namespace ReachableGames
 			}
 
 			// This is intended for you to grab all the messages that have been sent, in bulk and from the main thread, like in an MonoBehaviour.Update() method.
+			// NOTE: Any binary messages will need DecRef() called on them to return them to the byte array pool.  You own these messages now!
 			public void ReceiveAll(List<wsMessage> messageList)
 			{
 				// Take the whole set of incoming messages, lock it, then move it to messageList and clear it out
@@ -225,8 +226,10 @@ namespace ReachableGames
 				return Task.CompletedTask;
 			}
 
-			private Task OnReceiveBinary(RGWebSocket rgws, byte[] msg)
+			// This callback holds the reference to PooledArray, so it must be decremented to free it (eventually) after it's consumed.
+			private Task OnReceiveBinary(RGWebSocket rgws, PooledArray msg)
 			{
+				msg.IncRef();  // bump the refcount since we aren't done with it yet, and RGWebSocket can decrement it without freeing the buffer
 				_incomingMessages.Add(new wsMessage() { stringMsg = string.Empty, binMsg = msg });
 				_logger($"UWS Recv {msg.Length} bytes bin", 3);
 				return Task.CompletedTask;

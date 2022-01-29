@@ -11,7 +11,7 @@
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 
-	<VersionSuffix>1.0.14</VersionSuffix>
+	<VersionSuffix>1.0.15</VersionSuffix>
 	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
 	<Version>$(VersionSuffix)</Version>
 	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
@@ -50,7 +50,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Nito.AsyncEx.Coordination" Version="5.1.2" />
+    <PackageReference Include="Nito.AsyncEx.Coordination" Version="5.1.0" />
   </ItemGroup>
 
 </Project>

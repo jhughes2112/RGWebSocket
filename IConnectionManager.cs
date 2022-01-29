@@ -15,7 +15,7 @@ namespace ReachableGames
 			Task OnConnection(RGWebSocket rgws);
 			Task OnDisconnect(RGWebSocket rgws);
 			Task OnReceiveText(RGWebSocket rgws, string msg);
-			Task OnReceiveBinary(RGWebSocket rgws, byte[] msg);
+			Task OnReceiveBinary(RGWebSocket rgws, PooledArray msg);
 		}
 	}
 }
