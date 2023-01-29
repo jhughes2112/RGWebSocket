@@ -1,4 +1,5 @@
 ﻿using System.Threading.Tasks;
+using System.Net;
 
 namespace ReachableGames
 {
@@ -12,10 +13,11 @@ namespace ReachableGames
 		// connections, so it reduces overhead to put them in one place.  This neatly gives you a place to implement that.
 		public interface IConnectionManager
 		{
-			Task OnConnection(RGWebSocket rgws);
+			Task OnConnection(RGWebSocket rgws, HttpListenerContext context);
 			Task OnDisconnect(RGWebSocket rgws);
 			Task OnReceiveText(RGWebSocket rgws, string msg);
 			Task OnReceiveBinary(RGWebSocket rgws, PooledArray msg);
+			Task Shutdown();  // When shutting down, IConnectionManager must iterate over all RGWebSockets and call .Close() on them.
 		}
 	}
 }

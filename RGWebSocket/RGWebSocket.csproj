@@ -1,17 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net5.0</TargetFramework>
+    <TargetFramework>net7.0</TargetFramework>
     <RootNamespace>ReachableGames.RGWebSocket</RootNamespace>
     <ApplicationIcon>reachablegames.ico</ApplicationIcon>
-    <Copyright>Copyright 2021 Reachable Games LLC</Copyright>
-    <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 5, suitable for servers.</Description>
+    <Copyright>Copyright 2023 Reachable Games LLC</Copyright>
+    <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 7, suitable for servers.</Description>
     <PackageIcon>reachablegames.png</PackageIcon>
     <SignAssembly>true</SignAssembly>
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 	
-	<VersionSuffix>1.0.15</VersionSuffix>
+	<VersionSuffix>1.0.16</VersionSuffix>
 	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
 	<Version>$(VersionSuffix)</Version>
 	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>

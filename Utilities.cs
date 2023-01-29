@@ -2,6 +2,8 @@
 // Reachable Games
 // Copyright 2019
 //-------------------
+// Comment this in for exhaustive callstack tracing for where pooled arrays are being held onto.
+//#define LEAK_DEBUGGING
 
 using System;
 using System.Threading;
@@ -45,6 +47,8 @@ namespace ReachableGames
 			public void Add(T item) { lock (locker) { data.Add(item); } }
 			public void Clear()     { lock (locker) { data.Clear(); } }
  			public void MoveTo(List<T> array) { lock (locker) { array.AddRange(data); data.Clear(); } }
+ 			public bool Remove(T item) { lock (locker) { return data.Remove(item); } }
+            public void RemoveAt(int index) { lock (locker) { data.RemoveAt(index); } }
 		}
 
 		// Recycling arrays makes for much better memory performance.  There's some cost for the lock(), but I don't expect a lot of contention here since it's at the individual buffer-size level.
@@ -53,6 +57,9 @@ namespace ReachableGames
 			// This has an internal pool, so as not to pollute the StorageLocalBinary class.
 			static private ConcurrentDictionary<long, List<PooledArray>> pooledArrays = new ConcurrentDictionary<long, List<PooledArray>>();
 			static private ConcurrentDictionary<long, int>               liveArrays = new ConcurrentDictionary<long, int>();  // this counts the number that are allocated but not yet returned (if this grows, there's a leak!)
+#if LEAK_DEBUGGING
+			static private ConcurrentDictionary<string, int>             callstacksAtInc = new ConcurrentDictionary<string, int>();  // this is REALLY heavy.  Only for leak debugging.
+#endif
 			static public PooledArray BorrowFromPool(int length)
 			{
 				// Round up to powers of two, so we don't have too many different categories, but none smaller than 128 bytes.
@@ -77,6 +84,18 @@ namespace ReachableGames
 					PooledArray ret = poolList[poolList.Count-1];
 					ret.Length = length;
 					ret.IncRef();
+#if LEAK_DEBUGGING
+					string callstack = Environment.StackTrace;
+					ret.callstacks.Add(callstack);
+					for (;;)  // atomically increment the callstack count -- we're inside a lock, so I don't think we have to do this.
+					{
+						int value = 0;
+						if (callstacksAtInc.TryGetValue(callstack, out value)==false)
+							callstacksAtInc.TryAdd(callstack, value);  // if this succeeds or fails, all it means is the next loop will work
+						if (callstacksAtInc.TryUpdate(callstack, value+1, value))
+							break;
+					}
+#endif
 					poolList.RemoveAt(poolList.Count-1);
 					for (;;)  // atomic increment is complicated due to the concurrent dictionary
 					{
@@ -118,17 +137,51 @@ namespace ReachableGames
 							if (liveArrays.TryUpdate(roundedLength, value-1, value))
 								break;
 						}
+
+#if LEAK_DEBUGGING
+						foreach (string callstack in callstacks)
+						{
+							for (;;)  // atomically decrement the callstack count -- we're inside a lock, so I don't think we have to do this.
+							{
+								int value = 0;
+								if (callstacksAtInc.TryGetValue(callstack, out value)==false)
+									throw new Exception("Logic error: more decrements than increments for callstack.");
+								if (callstacksAtInc.TryUpdate(callstack, value-1, value))
+								{
+									if (value==1)
+										callstacksAtInc.TryRemove(callstack, out value);  // this is a race condition if it's outside the lock.
+									break;
+								}
+							}
+						}
+						callstacks.Clear();
+#endif
 					}
 				}
 			}
 			public void IncRef()  // necessary anytime code needs to hold onto a buffer for a little while, just increment the reference counter, but remember to decref when you're done with it.
 			{
 				Interlocked.Increment(ref refCount);
+#if LEAK_DEBUGGING
+				string callstack = Environment.StackTrace;
+				callstacks.Add(callstack);
+				for (;;)  // atomically increment the callstack count -- we're inside a lock, so I don't think we have to do this.
+				{
+					int value = 0;
+					if (callstacksAtInc.TryGetValue(callstack, out value)==false)
+						callstacksAtInc.TryAdd(callstack, value);  // if this succeeds or fails, all it means is the next loop will work
+					if (callstacksAtInc.TryUpdate(callstack, value+1, value))
+						break;
+				}
+#endif
 			}
-			public void Dispose()  // This just allows the using (...) syntax, it does NOT necessarily delete the object.
+			
+			// Make this private to enforce using the "using" syntax for exception safety
+			void IDisposable.Dispose()  // This just allows the using (...) syntax, it does NOT necessarily delete the object.
 			{
 				DecRef();  // this may or may not return this object to the pool... depends on the ref count
 			}
+			
 			private PooledArray(int roundedLength)
 			{
 				data = new byte[roundedLength];
@@ -138,6 +191,12 @@ namespace ReachableGames
 			public  byte[]      data;
 			public  int         Length = 0;    // This is the requested length of the array, which is usually slightly less than data.Length (which is always power of 2)
 			private int         refCount = 0;
+
+#if LEAK_DEBUGGING
+			// We keep a list of every callstack that incremented this array.  When the decref hits zero, we reduce the count in the central dictionary.  VERY heavy.
+			// Doesn't always tell us exactly where the leak is, but it tells us where the refcounts went wrong.
+			private List<string> callstacks = new List<string>();
+#endif
 		}
 	}
 }

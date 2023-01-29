@@ -39,7 +39,6 @@ namespace ReachableGames
 			private int                        _connectTimeoutMS;
 			private Dictionary<string, string> _connectHeaders = new Dictionary<string, string>();
 			public  Status                     _status { get; private set; }
-			private int                        _idleSeconds;          // if nothing happens in this period of time, disconnect
 
 			private RGWebSocket                _rgws;  // This should only be non-null when _status==Connected.
 			private Action<string, int>        _logger;
@@ -70,13 +69,12 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(Action<string, int> logger, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS, int idleSeconds)
+			public UnityWebSocket(Action<string, int> logger, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS)
 			{
 				_logger = logger;
 				_disconnectCallback = disconnectCallback;
 				_status = Status.ReadyToConnect;
 				_connectTimeoutMS = connectTimeoutMS;
-				_idleSeconds = idleSeconds;
 			}
 
 			// Forcibly disposes the RGWS
@@ -127,11 +125,12 @@ namespace ReachableGames
 
 						_status = Status.Connecting;
 						await wsClient.ConnectAsync(uri, connectTimeout.Token).ConfigureAwait(false);
+						_logger($"UWS Connected to {uri} #1", 1);
 					}
 
 					_status = Status.Connected;
 					_rgws = new RGWebSocket(null, OnReceiveText, OnReceiveBinary, OnDisconnect, _logger, uri.ToString(), wsClient);
-					_logger($"UWS Connected to {uri}", 1);
+					_logger($"UWS Connected to {uri} #2", 1);
 				}
 				catch (AggregateException age)
 				{
@@ -172,12 +171,12 @@ namespace ReachableGames
 				}
 			}
 
-			// A simple blocking way to make sure this is all torn down.
-			public void Shutdown()
+			// Make sure this is all torn down.
+			public async Task Shutdown()
 			{
 				if (_rgws!=null)
 				{
-					_rgws.Shutdown();
+					await _rgws.Shutdown().ConfigureAwait(false);
 					_rgws.Dispose();
 					_rgws = null;
 				}
@@ -237,11 +236,12 @@ namespace ReachableGames
 
 			// At this point, it's a done deal.  Both Recv and Send are completed, nothing to synchronize.  This is called at the bottom of the Send thread after Recv is completed.
 			// However, it is possible that the Recv/Send threads shutdown before the RGWS constructor is even finished 
-			private void OnDisconnect(RGWebSocket rgws)
+			private Task OnDisconnect(RGWebSocket rgws)
 			{
 				_logger("UWS Disconnected.", 1);
 				_status = Status.Disconnected;
 				_disconnectCallback?.Invoke(this);  // This callback needs to NOT modify any tracking structures, because it may be called as early as DURING the RGWS constructor.  Just set flags
+				return Task.CompletedTask;
 			}
 		}
 	}

@@ -27,10 +27,11 @@ namespace ReachableGames
 			private WebSocket                       _webSocket;
 			private Func<RGWebSocket, string, Task>      _onReceiveMsgTextCb;
 			private Func<RGWebSocket, PooledArray, Task> _onReceiveMsgBinaryCb;
-			private Action<RGWebSocket>             _onDisconnectionCb;      // this must run straight through and NOT touch any tracking structures the RGWS might be added to.  This maybe called DURING the constructor!
+			private Func<RGWebSocket, Task>              _onDisconnectionCb;      // this must run straight through and NOT touch any tracking structures the RGWS might be added to.  This maybe called DURING the constructor!
 			private Action<string, int>             _logger;
 
-			private const int kRecvBufferSize     = 4096; // buffer size for receiving chunks of messages
+			private const int kRecvBufferSize     = 4096;       // buffer size for receiving chunks of messages
+			private const int kMaxRecvPinnedMemory = 1024*128;  // more than 128kb at a time is pretty big to keep pinned in the receive task
 
 			private AsyncAutoResetEvent     _releaseSendThread = new AsyncAutoResetEvent(false);  // this makes it easy to release the send thread when a new message is available
 			private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
@@ -40,7 +41,6 @@ namespace ReachableGames
 			private byte[]                  _recvBuffer = new byte[kRecvBufferSize];
 			
 			// Basic metrics
-			public int    _uniqueId           { get; private set; }  // typically used by calling program to keep additional state in a dictionary
 			public string _displayId          { get; private set; }  // good for troubleshooting
 			public long   _connectedAtTicks   { get; private set; }
 			public int    _stats_sentMsgs     { get; private set; }
@@ -49,9 +49,6 @@ namespace ReachableGames
 			public long   _stats_recvBytes    { get; private set; }
 			public long   _stats_msgQueuedTime { get; private set; }
 			public string _lastError          { get { return _actualLastErr; } private set { _actualLastErr = value; } }
-
-			// This is used to generate globally unique id per execution instance, which can be retrieved by the caller for routing/tracking purposes as a connection id.
-			static private volatile int _wsUID = 1;
 
 			// when we want to close, we push this through Send() so it knows to initiate closure.  Can be static because it's a sentinel, and compared by address.
 			static private PooledArray sCloseOutputAsync = PooledArray.BorrowFromPool(1);
@@ -68,7 +65,7 @@ namespace ReachableGames
 			// DisplayId is only a human-readable string, uniqueId is generated here but not used internally, and is guaranteed to increment every time a websocket is created, 
 			// and configuration for how to handle when the send is backed up. The cancellation source is a way for the caller to tear down the socket under any circumstances 
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
-			public RGWebSocket(HttpListenerContext httpContext, Func<RGWebSocket, string, Task> onReceiveMsgText, Func<RGWebSocket, PooledArray, Task> onReceiveMsgBinary, Action<RGWebSocket> onDisconnectionCb, Action<string, int> onLog, string displayId, WebSocket webSocket)
+			public RGWebSocket(HttpListenerContext httpContext, Func<RGWebSocket, string, Task> onReceiveMsgText, Func<RGWebSocket, PooledArray, Task> onReceiveMsgBinary, Func<RGWebSocket, Task> onDisconnectionCb, Action<string, int> onLog, string displayId, WebSocket webSocket)
 			{
 				if (onReceiveMsgText==null || onReceiveMsgBinary==null || onDisconnectionCb==null)
 					throw new Exception("Cannot pass null in for callbacks.");
@@ -85,7 +82,6 @@ namespace ReachableGames
 				_connectedAtTicks = DateTime.UtcNow.Ticks;
 				_httpContext = httpContext;
 				_webSocket = webSocket;
-				_uniqueId = Interlocked.Increment(ref _wsUID);
 
 				_recvTask = Recv(_cancellationTokenSource.Token);
 				_sendTask = Send(_cancellationTokenSource.Token);
@@ -116,10 +112,10 @@ namespace ReachableGames
 			}
 
 			// This is an optional call where you want to shutdown the websocket but don't want to do so via Disconnected callback.  Just await this, then call Dispose.
-			public void Shutdown()
+			public Task Shutdown()
 			{
 				Abort();
-				_sendTask.Wait();  // when the send task is done, it's finished tearing down
+				return _sendTask;  // when the send task is done, it's finished tearing down
 			}
 
 			// Stops the Tasks, breaks the websocket connection and drops all the held resources.
@@ -128,7 +124,7 @@ namespace ReachableGames
 //				_logger($"{_displayId} Dispose called.", 4);
 
 				// Final teardown happens here, after the caller has been told of the disconnection.
-				Shutdown();  // If we don't wait for the tasks to complete, it throws an exception trying to dispose them, and probably leaves them running forever.
+				Shutdown().GetAwaiter().GetResult();  // If we don't wait for the tasks to complete, it throws an exception trying to dispose them, and probably leaves them running forever.
 				_recvTask.Dispose();
 				_sendTask.Dispose();
 				_webSocket.Dispose();  // never null out the _webSocket or tasks
@@ -242,7 +238,13 @@ namespace ReachableGames
 										using (PooledArray byteArray = PooledArray.BorrowFromPool(messageBytes.Count))  // avoid new allocations, instead try to pull from a known-size pool of messages
 										{
 											messageBytes.CopyTo(0, byteArray.data, 0, messageBytes.Count);
+											// According to the List.cs source code, this just resets the length of messageBytes, but does not deallocate anything.
+											// Seems like a dangerous situation if someone attempts to send megabytes at a time in a single message, that memory would stay allocated forever.
 											messageBytes.Clear();
+											if (messageBytes.Capacity > kMaxRecvPinnedMemory)
+											{
+												messageBytes.Capacity = 0;  // after really large messages, we should just reset capacity afterwards so we don't pin memory.
+											}
 
 											try
 											{
@@ -417,7 +419,7 @@ namespace ReachableGames
 						// Let the program know this socket is dead -- note this is on the Send thread, NOT main thread!!!
 						// This callback should do something simple like release a reaper thread, but not task switch.
 						// When reaping, always call Shutdown() first, to ensure this thread is done closing and changing status.
-						_onDisconnectionCb(this);
+						await _onDisconnectionCb(this).ConfigureAwait(false);
 					}
 				}
 			}
