@@ -1,6 +1,6 @@
 ﻿//-------------------
 // Reachable Games
-// Copyright 2019
+// Copyright 2023
 //-------------------
 
 using System;
@@ -9,7 +9,6 @@ using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Net.WebSockets;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using Nito.AsyncEx;
 

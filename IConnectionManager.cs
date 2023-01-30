@@ -1,4 +1,9 @@
-﻿using System.Threading.Tasks;
+﻿//-------------------
+// Reachable Games
+// Copyright 2023
+//-------------------
+
+using System.Threading.Tasks;
 using System.Net;
 
 namespace ReachableGames

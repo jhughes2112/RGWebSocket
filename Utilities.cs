@@ -1,6 +1,6 @@
 ﻿//-------------------
 // Reachable Games
-// Copyright 2019
+// Copyright 2023
 //-------------------
 // Comment this in for exhaustive callstack tracing for where pooled arrays are being held onto.
 //#define LEAK_DEBUGGING
