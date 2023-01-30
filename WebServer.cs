@@ -14,7 +14,7 @@ namespace ReachableGames
 	namespace RGWebSocket
 	{
 		// Use this to easily register endpoints for callbacks for normal HTTP requests, whereas all websocket upgrades will be handled by the IConnectionManager that is passed in.
-		class WebServer
+		public class WebServer
 		{
 			private readonly string              _url;
 			private readonly string              _urlPath;  // if this server is hosted at http://some.com/foo/bar then this variable will contain foo/bar for easy removal
