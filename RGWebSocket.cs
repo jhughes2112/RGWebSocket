@@ -254,7 +254,7 @@ namespace ReachableGames
 												}
 												else
 												{
-													await _onReceiveMsgTextCb(this, System.Text.Encoding.UTF8.GetString(byteArray.data)).ConfigureAwait(false);
+													await _onReceiveMsgTextCb(this, System.Text.Encoding.UTF8.GetString(byteArray.data, 0, byteArray.Length)).ConfigureAwait(false);
 												}
 											}
 //											catch (WebSocketException wse)
