@@ -114,6 +114,10 @@ namespace ReachableGames
 			// This is an optional call where you want to shutdown the websocket but don't want to do so via Disconnected callback.  Just await this, then call Dispose.
 			public Task Shutdown()
 			{
+				if (_cancellationTokenSource.IsCancellationRequested)  // avoid potential lockups if _sendTask is calling Shutdown.
+				{
+					return Task.CompletedTask;
+				}
 				Abort();
 				return _sendTask;  // when the send task is done, it's finished tearing down
 			}
