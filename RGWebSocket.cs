@@ -130,7 +130,10 @@ namespace ReachableGames
 				// Final teardown happens here, after the caller has been told of the disconnection.
 				Shutdown().GetAwaiter().GetResult();  // If we don't wait for the tasks to complete, it throws an exception trying to dispose them, and probably leaves them running forever.
 				_recvTask.Dispose();
-				_sendTask?.Dispose();
+				if (_sendTask!=null && (_sendTask.IsCompleted || _sendTask.IsCanceled || _sendTask.IsFaulted))
+				{
+					_sendTask?.Dispose();  // can only dispose if the task is done running.  When Send calls rgws.Close(), it calls the callback in the WebServer which may attempt to Dispose this while Send is still running.
+				}
 				_webSocket.Dispose();  // never null out the _webSocket or tasks
 				_httpContext?.Response.Close();  // in the client/Unity case, httpContext is null
 				_cancellationTokenSource.Dispose();
