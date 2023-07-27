@@ -21,12 +21,13 @@ namespace ReachableGames
 			private readonly int                 _listenerThreads;
 			private readonly int                 _connectionTimeoutMS;
 			private readonly int                 _idleSeconds;
-			private readonly Action<string, int> _logger;
+			private readonly OnLogDelegate       _logger;
 			private readonly IConnectionManager  _connectionManager;
+			private CancellationTokenSource      _cancellationTokenSrc = null;  // this gets allocated and destroyed based on server status being listening or not.
 
 			//-------------------
 
-			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, Action<string, int> logger)
+			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, OnLogDelegate logger)
 			{
 				_url                 = url;
 				_listenerThreads     = listenerThreads;
@@ -37,44 +38,59 @@ namespace ReachableGames
 
 				string[] urlParts = url.Split('/');  // When you have a url, you have protocol://domain:port/path/part/etc
 				_urlPath          = string.Join('/', urlParts, 3, urlParts.Length-3);  // this leaves you with path/part/etc
+				_cancellationTokenSrc = new CancellationTokenSource();
 			}
 
 			//-------------------
 
-			public async Task Start(CancellationTokenSource tokenSrc)
+			public async Task Start()
 			{
-				using (WebSocketServer httpServer = new WebSocketServer(_listenerThreads, _connectionTimeoutMS, _idleSeconds, _url, HttpRequestHandler, _connectionManager, _logger))
-				{
-					try
-					{
-						httpServer.StartListening();  // start listening AFTER we have registered the handlers
+				if (_cancellationTokenSrc!=null)
+					throw new Exception("WebServer cannot be started multiple times without Shutdown being called.");
 
-						// Since the main program passed in the cancellation token, it literally controls the completion of this task,
-						// which only happens when told to shut down with ^C or SIGINT.
-						await tokenSrc.Token;  // magic!
-					}
-					catch (OperationCanceledException)
+				_cancellationTokenSrc = new CancellationTokenSource();
+				using (_cancellationTokenSrc)
+				{
+					using (WebSocketServer httpServer = new WebSocketServer(_listenerThreads, _connectionTimeoutMS, _idleSeconds, _url, HttpRequestHandler, _connectionManager, _logger))
 					{
-						_logger("Canceling WebServer.", 0);
-					}
-					catch (Exception e)
-					{
-						if (e is HttpListenerException)
+						try
 						{
-							_logger("If you get an Access Denied error, open an ADMIN command shell and run:", 0);
-							_logger($"   netsh http add urlacl url={_url} user=\"{Environment.UserDomainName}\\{Environment.UserName}\"", 0);
+							httpServer.StartListening();  // start listening AFTER we have registered the handlers
+
+							// Since the main program passed in the cancellation token, it literally controls the completion of this task,
+							// which only happens when told to shut down with ^C or SIGINT.
+							await _cancellationTokenSrc.Token;  // magic!
 						}
-						else
+						catch (OperationCanceledException)
 						{
-							_logger($"Exception: {e}", 0);
+							_logger(ELogVerboseType.Error, "Canceling WebServer.");
 						}
-					}
-					finally
-					{
-						await httpServer.StopListening().ConfigureAwait(false);  // kill all the connections and abort any that don't die quietly
-						_logger("WebServer has shutdown", 1);
+						catch (Exception e)
+						{
+							if (e is HttpListenerException)
+							{
+								_logger(ELogVerboseType.Error, "If you get an Access Denied error, open an ADMIN command shell and run:");
+								_logger(ELogVerboseType.Error, $"   netsh http add urlacl url={_url} user=\"{Environment.UserDomainName}\\{Environment.UserName}\"");
+							}
+							else
+							{
+								_logger(ELogVerboseType.Error, $"Exception: {e}");
+							}
+						}
+						finally
+						{
+							await httpServer.StopListening().ConfigureAwait(false);  // kill all the connections and abort any that don't die quietly
+							_logger(ELogVerboseType.Warning, "WebServer has shutdown");
+						}
 					}
 				}
+				_cancellationTokenSrc = null;
+			}
+
+			public void Shutdown()
+			{
+				_cancellationTokenSrc?.Cancel();
+				_logger(ELogVerboseType.Error, "WebServer shutdown requested");
 			}
 
 			//-------------------
@@ -88,7 +104,7 @@ namespace ReachableGames
 			{
 				if (_endpointHandlers.TryAdd(urlPath, handler) == false)
 				{
-					_logger($"RegisterEndpoint {urlPath} is already defined.  Ignoring.", 0);
+					_logger(ELogVerboseType.Error, $"RegisterEndpoint {urlPath} is already defined.  Ignoring.");
 				}
 			}
 
@@ -96,7 +112,7 @@ namespace ReachableGames
 			{
 				if (_endpointHandlers.Remove(urlPath) == false)
 				{
-					_logger($"UnregisterEndpoint {urlPath} not found to unregister.", 0);
+					_logger(ELogVerboseType.Error, $"UnregisterEndpoint {urlPath} not found to unregister.");
 				}
 			}
 

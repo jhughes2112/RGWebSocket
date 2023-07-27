@@ -16,7 +16,7 @@ namespace ReachableGames
 		// This enforces the everything-happens-on-main-thread requirement to work with Unity as a game platform.  This has been built in such a way to allow
 		// you to connect/close/connect multiple times without having to destroy it.  In many cases, you will want to reconnect on foregrounding and disconnection
 		// (probably) happens automatically on backgrounding, so important to make it easy.
-		public class UnityWebSocket : IDisposable
+		public class UnityWebSocket
 		{
 			// This tracks the status of RGWS, which is hard to determine directly from inspection due to async operations.
 			public enum Status
@@ -24,7 +24,6 @@ namespace ReachableGames
 				ReadyToConnect,
 				Connecting,
 				Connected,
-				Disconnected
 			}
 
 			// Supports strings or binary messages on the websocket.  If binMsg is null, it's a string.
@@ -38,16 +37,19 @@ namespace ReachableGames
 			private string                     _connectUrl;           // caching the connection params so Reconnect is possible w/o downstream users needing to know the details
 			private int                        _connectTimeoutMS;
 			private Dictionary<string, string> _connectHeaders = new Dictionary<string, string>();
-			public  Status                     _status { get; private set; }
+			private Status                     _status = Status.ReadyToConnect;
 
 			private RGWebSocket                _rgws;  // This should only be non-null when _status==Connected.
-			private Action<string, int>        _logger;
+			private OnLogDelegate              _logger;
+			private string                     _loggerPrefix = "";
 			private string                     _lastErrorMsg = string.Empty;
 			private Action<UnityWebSocket>     _disconnectCallback;
 
 			//-------------------
 			// Trivial accessors
-			public bool IsConnected => (_rgws!=null && _rgws.ReadyToSend);
+			public bool IsConnected => _status == Status.Connected;
+			public bool IsConnecting => _status == Status.Connecting;
+			public bool IsDisconnected => _status == Status.ReadyToConnect;
 			public string LastError { get { return _rgws?._lastError ?? _lastErrorMsg; } private set { _lastErrorMsg = value; } }
 			public void GetStats(out int sentMsgs, out long sentBytes, out int recvMsgs, out long recvBytes)
 			{
@@ -69,19 +71,18 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(Action<string, int> logger, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS)
+			public UnityWebSocket(OnLogDelegate logger, string loggerPrefix, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS)
 			{
 				_logger = logger;
+				_loggerPrefix = loggerPrefix;
 				_disconnectCallback = disconnectCallback;
-				_status = Status.ReadyToConnect;
 				_connectTimeoutMS = connectTimeoutMS;
 			}
 
-			// Forcibly disposes the RGWS
-			public void Dispose()
+			// Use this function to automatically include the loggerPrefix on each message.
+			private void Log(ELogVerboseType type, string message)
 			{
-				_rgws?.Dispose();
-				_rgws = null;
+				_logger(type, $"{_loggerPrefix} {message}");
 			}
 
 			// Lets you specify where to connect to.
@@ -125,73 +126,77 @@ namespace ReachableGames
 
 						_status = Status.Connecting;
 						await wsClient.ConnectAsync(uri, connectTimeout.Token).ConfigureAwait(false);
-						_logger($"UWS Connected to {uri} #1", 1);
+						Log(ELogVerboseType.Warning, $"UWS Connected to {uri} http part");
 					}
 
 					_status = Status.Connected;
 					_rgws = new RGWebSocket(null, OnReceiveText, OnReceiveBinary, OnDisconnect, _logger, uri.ToString(), wsClient);
-					_logger($"UWS Connected to {uri} #2", 1);
+					Log(ELogVerboseType.Warning, $"UWS Connected to {uri} rgws part");
 				}
 				catch (AggregateException age)
 				{
 					if (age.InnerException is OperationCanceledException)
 					{
 						_lastErrorMsg = "Connection timed out.";
-						_logger(_lastErrorMsg, 0);
+						Log(ELogVerboseType.Error, _lastErrorMsg);
 					}
 					else if (age.InnerException is WebSocketException)
 					{
 						_lastErrorMsg = ((WebSocketException)age.InnerException).Message;
-						_logger(_lastErrorMsg, 0);
+						Log(ELogVerboseType.Error, _lastErrorMsg);
 					}
 					else
 					{
 						_lastErrorMsg = age.Message;
-						_logger(_lastErrorMsg, 0);
+						Log(ELogVerboseType.Error, _lastErrorMsg);
 					}
 					wsClient?.Dispose();  // cleanup
-					_status = Status.Disconnected;
+					Shutdown();  // this just resets everything so we can try connecting again
 				}
 				catch (Exception e)
 				{
 					_lastErrorMsg = e.Message;
-					_logger(_lastErrorMsg, 0);
+					Log(ELogVerboseType.Error, _lastErrorMsg);
 					wsClient?.Dispose();  // cleanup
-					_status = Status.Disconnected;
+					Shutdown();  // this just resets everything so we can try connecting again
 				}
 			}
 
 			// This is a friendly close, where we tell the other side and they shake on it.
 			public void Close()
 			{
-				if (_status==Status.Connected && _rgws!=null && _rgws.ReadyToSend)
+				if (_status==Status.Connected)
 				{
 					_rgws.Close();
-					_logger("UWS Closed.", 1);
+					Log(ELogVerboseType.Warning, "UWS Closed.");
 				}
 			}
 
-			// Make sure this is all torn down.
-			public async Task Shutdown()
+			// A simple blocking way to make sure this is all torn down.
+			public void Shutdown()
 			{
 				if (_rgws!=null)
 				{
-					await _rgws.Shutdown().ConfigureAwait(false);
-					_rgws.Dispose();
+					RGWebSocket rgws = _rgws;  // prevent recursion here in shutdown
 					_rgws = null;
+					rgws.Shutdown().Wait();
+					Log(ELogVerboseType.Warning, "UWS connection reset.");
 				}
-				_logger("UWS shutdown.", 1);
 				_status = Status.ReadyToConnect;
 			}
 
 			// Returns false if data could not be sent (eg. you aren't connected or in a good status to do so)
 			public bool Send(string msg)
 			{
-				if (_status == Status.Connected && _rgws != null && _rgws.ReadyToSend)
+				if (_status == Status.Connected)
 				{
 					_rgws.Send(msg);
-					_logger($"UWS Sent {msg.Length} bytes", 3);
+					Log(ELogVerboseType.Debug, $"UWS Sent {msg.Length} bytes");
 					return true;
+				}
+				else
+				{
+					Log(ELogVerboseType.Debug, $"UWS Send called but status is {_status}");
 				}
 				return false;
 			}
@@ -199,11 +204,15 @@ namespace ReachableGames
 			// Returns false if data could not be sent (eg. you aren't connected or in a good status to do so)
 			public bool Send(PooledArray msg)
 			{
-				if (_status == Status.Connected && _rgws != null && _rgws.ReadyToSend)
+				if (_status == Status.Connected)
 				{
 					_rgws.Send(msg);
-					_logger($"UWS Sent {msg.Length} bytes", 3);
+					Log(ELogVerboseType.Debug, $"UWS Sent {msg.Length} bytes");
 					return true;
+				}
+				else
+				{
+					Log(ELogVerboseType.Debug, $"UWS Send called but status is {_status}");
 				}
 				return false;
 			}
@@ -221,7 +230,7 @@ namespace ReachableGames
 			private Task OnReceiveText(RGWebSocket rgws, string msg)
 			{
 				_incomingMessages.Add(new wsMessage() { stringMsg = msg, binMsg = null });
-				_logger($"UWS Recv {msg.Length} bytes txt", 3);
+				Log(ELogVerboseType.Debug, $"UWS Recv {msg.Length} bytes txt");
 				return Task.CompletedTask;
 			}
 
@@ -230,7 +239,7 @@ namespace ReachableGames
 			{
 				msg.IncRef();  // bump the refcount since we aren't done with it yet, and RGWebSocket can decrement it without freeing the buffer
 				_incomingMessages.Add(new wsMessage() { stringMsg = string.Empty, binMsg = msg });
-				_logger($"UWS Recv {msg.Length} bytes bin", 3);
+				Log(ELogVerboseType.Debug, $"UWS Recv {msg.Length} bytes binary.  IncomingMessages={_incomingMessages.Count}");
 				return Task.CompletedTask;
 			}
 
@@ -238,8 +247,8 @@ namespace ReachableGames
 			// However, it is possible that the Recv/Send threads shutdown before the RGWS constructor is even finished 
 			private Task OnDisconnect(RGWebSocket rgws)
 			{
-				_logger("UWS Disconnected.", 1);
-				_status = Status.Disconnected;
+				Log(ELogVerboseType.Warning, "UWS Disconnected.");
+				_status = Status.ReadyToConnect;
 				_disconnectCallback?.Invoke(this);  // This callback needs to NOT modify any tracking structures, because it may be called as early as DURING the RGWS constructor.  Just set flags
 				return Task.CompletedTask;
 			}
