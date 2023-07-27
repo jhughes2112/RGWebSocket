@@ -11,7 +11,7 @@
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 
-	<VersionSuffix>1.0.23</VersionSuffix>
+	<VersionSuffix>1.0.24</VersionSuffix>
 	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
 	<Version>$(VersionSuffix)</Version>
 	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>

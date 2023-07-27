@@ -38,7 +38,6 @@ namespace ReachableGames
 
 				string[] urlParts = url.Split('/');  // When you have a url, you have protocol://domain:port/path/part/etc
 				_urlPath          = string.Join('/', urlParts, 3, urlParts.Length-3);  // this leaves you with path/part/etc
-				_cancellationTokenSrc = new CancellationTokenSource();
 			}
 
 			//-------------------
