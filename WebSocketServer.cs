@@ -1,6 +1,6 @@
 ﻿//-------------------
 // Reachable Games
-// Copyright 2019
+// Copyright 2023
 //-------------------
 
 using System;
@@ -9,10 +9,7 @@ using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Net.WebSockets;
-using System.Collections.Concurrent;
 using System.Diagnostics;
-using Nito.AsyncEx;
-using Nito.AsyncEx.Synchronous;
 
 namespace ReachableGames
 {
@@ -27,6 +24,7 @@ namespace ReachableGames
 
 			private int                       _listenerTasks;
 			private int                       _connectionMS;
+			private int                       _idleSeconds;
 			private string                    _prefixURL;
 			private OnHttpRequest             _httpRequestCallback;
 			private OnLogDelegate             _logger;
@@ -48,25 +46,27 @@ namespace ReachableGames
 				_httpRequestCallback = httpRequest;
 				_logger              = logger;
 				_connectionManager   = connectionManager;
-
-				_listener = new HttpListener();
-				_listener.Prefixes.Add(_prefixURL);
-				_listener.TimeoutManager.IdleConnection = TimeSpan.FromSeconds(idleSeconds);  // idle connections are cut after this long -- note, this doesn't affect websockets at all.
+				_idleSeconds         = idleSeconds;
 			}
 
 			public void Dispose()
 			{
-				_logger(ELogVerboseType.Info, $"WebSocketServer.Dispose - shutting down HttpListener, aborting all websockets (Still Listening? {_listener.IsListening})");
-				if (_listener.IsListening)
+				if (_listener!=null)
 					StopListening().GetAwaiter().GetResult();  // block
-				_listener.Close();
+				_logger(ELogVerboseType.Info, $"WebSocketServer.Dispose");
 			}
 
 			public void StartListening()
 			{
+				if (_listener!=null)
+					throw new Exception("WebSocketServer.StartListening should not be called twice without StopListening");
+
 				// Kick off the listener update task.  It makes sure there are always _maxCount listener threads available to accept incoming connections.
 				try
 				{
+					_listener = new HttpListener();
+					_listener.Prefixes.Add(_prefixURL);
+					_listener.TimeoutManager.IdleConnection = TimeSpan.FromSeconds(_idleSeconds);  // idle connections are cut after this long -- note, this doesn't affect websockets at all.
 					_listener.Start();
 					_listenerUpdateTask = ListenerUpdate(_listenerTasks);
 					_logger(ELogVerboseType.Info, "WebSocketServer.Start");
@@ -81,12 +81,20 @@ namespace ReachableGames
 			// Blocks until the listener task is torn down.  This ABORTS current connections.
 			public async Task StopListening()
 			{
-				_logger(ELogVerboseType.Info, "WebSocketServer.StopListening");
-				_listener.Stop();  // this sets all WebSocket statuses = ABORTED.  However, this causes ObjectDisposedException when it doesn't Start properly.
-				await _listenerUpdateTask.ConfigureAwait(false);
-				_listenerUpdateTask.Dispose();
-				await _connectionManager.Shutdown().ConfigureAwait(false);  // disconnect all existing RGWS connections
-				_logger(ELogVerboseType.Info, "WebSocketServer.StopListening completed");
+				if (_listener!=null && _listener.IsListening)
+				{
+					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening ConnectionManager.Shutdown");
+					await _connectionManager.Shutdown().ConfigureAwait(false);  // disconnect all existing RGWS connections
+					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening Listener.Stop");
+					_listener.Stop();  // this sets all WebSocket statuses = ABORTED.  However, this causes ObjectDisposedException when it doesn't Start properly.
+					await _listenerUpdateTask.ConfigureAwait(false);
+					_listenerUpdateTask.Dispose();
+					_listenerUpdateTask = Task.CompletedTask;
+					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening Listener.Close");
+					_listener.Close();
+					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening Complete");
+				}
+				_listener = null;
 			}
 
 			//-------------------
@@ -182,7 +190,7 @@ namespace ReachableGames
 						using (CancellationTokenSource upgradeTimeout = new CancellationTokenSource(timeoutMS))
 						{
 							// The TimeSpan is supposed to be the websocket keepalives.  But does not appear to affect anything. I would disable keepalives if I could.
-							HttpListenerWebSocketContext webSocketContext = await httpContext.AcceptWebSocketAsync(null, TimeSpan.FromSeconds(1)).WaitAsync<HttpListenerWebSocketContext>(upgradeTimeout.Token);
+							HttpListenerWebSocketContext webSocketContext = await httpContext.AcceptWebSocketAsync(null, TimeSpan.FromSeconds(1)).WaitAsync(upgradeTimeout.Token);
 							_logger(ELogVerboseType.Debug, "WebSocketServer.HandleConnection - websocket detected.  Upgraded.");
 
 							// Note, we hook our own OnDisconnect before proxying it on to the ConnectionManager.  Note, due to heavy congestion and C# scheduling, it's entirely possible that this is already a closed socket, and is immediately flagged for destruction.
@@ -220,15 +228,11 @@ namespace ReachableGames
 					}
 					catch (OperationCanceledException ex)  // timeout
 					{
-						_logger(ELogVerboseType.Error, $"WebSocketServer.HandleConnection - websocket upgrade timeout {ex}");
-						httpContext.Response.StatusCode = 500;
-//						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
+						_logger(ELogVerboseType.Error, $"WebSocketServer.HandleConnection - http callback cancelled {ex}");
 					}
 					catch (Exception ex) // anything else
 					{
 						_logger(ELogVerboseType.Error, $"WebSocketServer.HandleConnection - http callback handler exception {ex}");
-						httpContext.Response.StatusCode = 500;
-//						httpContext.Response.Abort();  // this breaks the connection, otherwise it may linger forever
 					}
 					finally
 					{

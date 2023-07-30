@@ -2,6 +2,8 @@
 // Reachable Games
 // Copyright 2023
 //-------------------
+// Uncomment to provide more detailed logging.  Errors from exceptions are always logged, as is the final stats for a closed socket.
+//#define RGWS_LOGGING
 
 using System;
 using System.Net.WebSockets;
@@ -19,7 +21,7 @@ namespace ReachableGames
 		public class UnityWebSocket
 		{
 			// This tracks the status of RGWS, which is hard to determine directly from inspection due to async operations.
-			public enum Status
+			private enum Status
 			{
 				ReadyToConnect,
 				Connecting,
@@ -191,7 +193,9 @@ namespace ReachableGames
 				if (_status == Status.Connected)
 				{
 					_rgws.Send(msg);
+#if RGWS_LOGGING
 					Log(ELogVerboseType.Debug, $"UWS Sent {msg.Length} bytes");
+#endif
 					return true;
 				}
 				else
@@ -207,7 +211,9 @@ namespace ReachableGames
 				if (_status == Status.Connected)
 				{
 					_rgws.Send(msg);
+#if RGWS_LOGGING
 					Log(ELogVerboseType.Debug, $"UWS Sent {msg.Length} bytes");
+#endif
 					return true;
 				}
 				else
@@ -230,7 +236,9 @@ namespace ReachableGames
 			private Task OnReceiveText(RGWebSocket rgws, string msg)
 			{
 				_incomingMessages.Add(new wsMessage() { stringMsg = msg, binMsg = null });
+#if RGWS_LOGGING
 				Log(ELogVerboseType.Debug, $"UWS Recv {msg.Length} bytes txt");
+#endif
 				return Task.CompletedTask;
 			}
 
@@ -239,7 +247,9 @@ namespace ReachableGames
 			{
 				msg.IncRef();  // bump the refcount since we aren't done with it yet, and RGWebSocket can decrement it without freeing the buffer
 				_incomingMessages.Add(new wsMessage() { stringMsg = string.Empty, binMsg = msg });
+#if RGWS_LOGGING
 				Log(ELogVerboseType.Debug, $"UWS Recv {msg.Length} bytes binary.  IncomingMessages={_incomingMessages.Count}");
+#endif
 				return Task.CompletedTask;
 			}
 

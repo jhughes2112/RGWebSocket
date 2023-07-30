@@ -11,11 +11,12 @@
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 	
-	<VersionSuffix>1.0.24</VersionSuffix>
+	<VersionSuffix>1.0.25</VersionSuffix>
 	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
 	<Version>$(VersionSuffix)</Version>
 	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
 	<PackageLicenseExpression>MIT</PackageLicenseExpression>
+	<PackageReadmeFile>readme.md</PackageReadmeFile>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -49,6 +50,7 @@
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
     <Compile Include="..\WebServer.cs" Link="WebServer.cs" />
     <Compile Include="..\WebSocketServer.cs" Link="WebSocketServer.cs" />
+	<None Include="..\readme.md" Pack="true" PackagePath="\"/>
   </ItemGroup>
 
   <ItemGroup>
