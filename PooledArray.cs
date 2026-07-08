@@ -11,9 +11,7 @@
 using System;
 using System.Threading;
 using System.Collections.Generic;
-using System.Collections.Concurrent;
 using Logging;
-using Shared;
 
 //-------------------
 
@@ -74,7 +72,17 @@ namespace ReachableGames
 			static private long _liveAllocSize = 0;
 			static private long _warnAt     = 10000;
 			static private ILogging? _logger;  // if you assign a logger, you'll get leak alerts at >10,000 buffers.
-			static private ThreadSafeDictionary<long, LockingList<PooledArray>> _pooledArrays = new ThreadSafeDictionary<long, LockingList<PooledArray>>();
+
+			// Bucket sizes are powers of two, so the pool is a flat array indexed by exponent -- no dictionary, no reader/writer
+			// lock on the hot path, just one direct index.  Slots below 2^7 (=128, the minimum bucket) simply go unused.
+			static private readonly LockingList<PooledArray>[] _pools = CreatePools();
+			static private LockingList<PooledArray>[] CreatePools()
+			{
+				LockingList<PooledArray>[] pools = new LockingList<PooledArray>[32];
+				for (int i=0; i<pools.Length; i++)
+					pools[i] = new LockingList<PooledArray>();
+				return pools;
+			}
 #if LEAK_DEBUGGING
 			static private LockingList<PooledArray> _borrowedArrays = new LockingList<PooledArray>();   // Keep a list of all the PooledArray objects currently borrowed by something.
 			static private long _lastAgeCheckTicks = 0L;
@@ -94,21 +102,20 @@ namespace ReachableGames
 			static public PooledArray BorrowFromPool(int length)
 			{
 				// Round up to powers of two, so we don't have too many different categories, but none smaller than 128 bytes.
+				// The same loop computes the bucket index, which is a direct slot in _pools.
+				int bucket = 7;
 				int roundedLength = 128;
 				while (roundedLength < length)
-					roundedLength *= 2;
-
-				// Create the list the first time we need it
-				LockingList<PooledArray>? poolList;
-				if (!_pooledArrays.TryGetValue(roundedLength, out poolList))
 				{
-					poolList = _pooledArrays.GetOrAdd(roundedLength, () => new LockingList<PooledArray>());  // always succeeds
+					roundedLength <<= 1;
+					bucket++;
 				}
 
-				PooledArray? ret = poolList!.PopBack();
+				LockingList<PooledArray> poolList = _pools[bucket];
+				PooledArray? ret = poolList.PopBack();
 				if (ret==null)
 				{
-					ret = new PooledArray(roundedLength);  // create a new record if we're ever out of them
+					ret = new PooledArray(roundedLength, poolList);  // create a new record if we're ever out of them; it remembers its home bucket so returning it costs no lookup at all
 				}
 				ret.Length = length;
 
@@ -152,20 +159,15 @@ namespace ReachableGames
 				if (newCount==0)
 				{
 #if DEBUG
-					// Wipe out the array.  This is more to prevent logic errors where the array is returned and you keep
-					// using its contents, so in release builds we don't do this.  Maybe we should, for security reasons too?
+					// Use-after-free tripwire: whole-buffer fill so a stale reference reading ANY part of the buffer (including the
+					// tail, where wrong-Length bugs look) sees obvious garbage.  Debug builds only -- Release pays zero cycles here.
 					Array.Fill<byte>(_data, 0xBE);
 #endif
 					Length = -1;
-
-					// data.Length is always a power of two already, so we just use that.
-					int roundedLength = _data.Length;
-
-					_pooledArrays.TryGetValue(roundedLength, out LockingList<PooledArray>? poolList);
-					poolList!.Add(this);
+					_homePool.Add(this);  // straight back into the bucket it came from, no lookup
 
 					Interlocked.Decrement(ref _liveAllocs);
-					Interlocked.Add(ref _liveAllocSize, -roundedLength);
+					Interlocked.Add(ref _liveAllocSize, -_data.Length);  // data.Length is always the power-of-two bucket size
 
 #if LEAK_DEBUGGING
 					_borrowedArrays.Remove(this);
@@ -239,10 +241,10 @@ namespace ReachableGames
 			// Make this private to enforce using the "using" syntax for exception safety
 			// this may or may not return this object to the pool... depends on the ref count
 			void IDisposable.Dispose() { DecRef(); }
-			private PooledArray(int roundedLength) { data = new byte[roundedLength]; }
+			private PooledArray(int roundedLength, LockingList<PooledArray> homePool) { data = new byte[roundedLength]; _homePool = homePool; }
 
-			public  byte[]      data { 
-				get { 
+			public  byte[]      data {
+				get {
 #if LEAK_DEBUGGING
 						_interactions.Add($"Accessed at {Environment.StackTrace}");
 #endif
@@ -253,6 +255,7 @@ namespace ReachableGames
 			public  int         Length = 0;    // This is the requested length of the array, which is usually slightly less than data.Length (which is always power of 2)
 			private int         refCount = 0;
 			private byte[]?     _data;
+			private readonly LockingList<PooledArray> _homePool;  // the bucket this buffer belongs to, so returning it costs zero lookups
 
 #if LEAK_DEBUGGING
 			// Keep track of when the array was borrowed and where it was borrowed from.

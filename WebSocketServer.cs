@@ -13,7 +13,6 @@ using System.Net.WebSockets;
 using System.Diagnostics;
 using DataCollection;
 using Logging;
-using Nito.AsyncEx;
 using Shared;
 
 namespace ReachableGames
@@ -44,8 +43,7 @@ namespace ReachableGames
 
 			// Dead websockets are handed to the reaper task for final Shutdown(), because RGWebSocket's onDisconnection callback runs
 			// ON the socket's own send task -- awaiting Shutdown() there would be waiting for yourself to finish.  The reaper does it from outside.
-			private LockingList<RGWebSocket>  _reapQueue = new LockingList<RGWebSocket>();
-			private AsyncAutoResetEvent       _reaperWake = new AsyncAutoResetEvent(false);
+			private ChannelQueue<RGWebSocket> _reapQueue = new ChannelQueue<RGWebSocket>(singleReader: true, singleWriter: false);  // wakes the reaper on its own, no separate event needed
 			private Task                      _reaperTask = Task.CompletedTask;
 			private CancellationTokenSource?  _reaperCancel = null;  // also cancels the idle sweep -- they share a lifecycle
 			private int                       _pendingReaps = 0;  // sockets queued for reaping or mid-reap; StopListening waits for this to hit zero
@@ -154,7 +152,7 @@ namespace ReachableGames
 				{
 					try
 					{
-						await _reaperWake.WaitAsync(token).ConfigureAwait(false);
+						await _reapQueue.WaitToReadAsync(token).ConfigureAwait(false);
 					}
 					catch (OperationCanceledException)  // not an error, flow control
 					{
@@ -428,8 +426,7 @@ namespace ReachableGames
 					_liveSockets.Remove(rgws);  // no longer a candidate for the idle sweep
 					Metrics.RecordDisconnect(rgws);  // fold this socket's lifetime stats into the distributions, tagged by cause
 					Interlocked.Increment(ref _pendingReaps);
-					_reapQueue.Add(rgws);
-					_reaperWake.Set();
+					_reapQueue.Add(rgws);  // the reaper's WaitToReadAsync wakes on its own
 				}
 			}
 		}

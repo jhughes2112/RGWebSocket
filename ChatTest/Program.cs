@@ -209,7 +209,11 @@ namespace ReachableGames
 						await bloater.ConnectAsync(new Uri($"ws://localhost:{port}/"), CancellationToken.None).ConfigureAwait(false);
 						byte[] bloaterIam = System.Text.Encoding.UTF8.GetBytes($"iam {Guid.NewGuid()}");
 						await bloater.SendAsync(new ArraySegment<byte>(bloaterIam), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
-						await Task.Delay(250).ConfigureAwait(false);  // let it register (1 member)
+						{
+							long regDeadline = Environment.TickCount64 + 5000;  // wait until the server actually REGISTERS it, otherwise the death-poll below can see count==0 before it ever hit 1
+							while (mgr.CurrentCount<1 && Environment.TickCount64<regDeadline)
+								await Task.Delay(25).ConfigureAwait(false);
+						}
 						try
 						{
 							byte[] huge = new byte[2*1024*1024];  // 2MB, double the configured 1MB inbound limit
@@ -239,6 +243,11 @@ namespace ReachableGames
 						await lurker.ConnectAsync(new Uri($"ws://localhost:{port}/"), CancellationToken.None).ConfigureAwait(false);
 						byte[] lurkerIam = System.Text.Encoding.UTF8.GetBytes($"iam {Guid.NewGuid()}");
 						await lurker.SendAsync(new ArraySegment<byte>(lurkerIam), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
+						{
+							long regDeadline = Environment.TickCount64 + 5000;  // wait until the server actually REGISTERS it, otherwise the death-poll below can see count==0 before it ever hit 1
+							while (mgr.CurrentCount<1 && Environment.TickCount64<regDeadline)
+								await Task.Delay(25).ConfigureAwait(false);
+						}
 						long lurkerStart = Environment.TickCount64;
 						Task drainTask = Task.Run(async () =>  // stay alive and reading, completing the close handshake politely when it comes
 						{

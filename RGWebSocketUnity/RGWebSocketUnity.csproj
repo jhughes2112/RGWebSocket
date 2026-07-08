@@ -14,8 +14,6 @@
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <DelaySign>false</DelaySign>
     <Nullable>disable</Nullable>
-    <!-- CS8002: Nito.AsyncEx is not strong-named.  Unity/Mono/.NET Core do not enforce strong-name loading, so this is harmless. -->
-    <NoWarn>$(NoWarn);CS8002</NoWarn>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -29,6 +27,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="..\ChannelQueue.cs" Link="ChannelQueue.cs" />
     <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
     <Compile Include="..\LockingList.cs" Link="LockingList.cs" />
     <Compile Include="..\PooledArray.cs" Link="PooledArray.cs" />
@@ -45,7 +44,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Nito.AsyncEx.Coordination" Version="5.1.2" />
+    <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
   </ItemGroup>
 
 </Project>

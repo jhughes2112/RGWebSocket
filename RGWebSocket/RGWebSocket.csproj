@@ -26,6 +26,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="..\ChannelQueue.cs" Link="ChannelQueue.cs" />
     <Compile Include="..\IConnectionManager.cs" Link="IConnectionManager.cs" />
     <Compile Include="..\IDataCollection.cs" Link="IDataCollection.cs" />
     <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
@@ -46,8 +47,6 @@
     <None Include="reachablegames.png" Pack="true" PackagePath="" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Nito.AsyncEx.Coordination" Version="5.1.2" />
-  </ItemGroup>
+  <!-- No package dependencies: System.Threading.Channels is part of the .NET 10 shared framework. -->
 
 </Project>

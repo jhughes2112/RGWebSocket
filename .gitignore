@@ -9,3 +9,4 @@
 push_to_nuget.bat
 shadow.snk
 *.user
+**/BenchmarkDotNet.Artifacts/

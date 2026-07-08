@@ -38,7 +38,7 @@ namespace ReachableGames
 				public bool        isText;  // true = UTF8 text payload
 				public string Text => System.Text.Encoding.UTF8.GetString(msg.data, 0, msg.Length);  // decode helper, only pay for the string when you ask for it
 			}
-			private LockingList<wsMessage>     _incomingMessages = new LockingList<wsMessage>();
+			private ChannelQueue<wsMessage>    _incomingMessages = new ChannelQueue<wsMessage>(singleReader: true, singleWriter: true);  // written only by the recv task, drained only by the main thread's ReceiveAll poll
 
 			private string                     _connectUrl;           // caching the connection params so Reconnect is possible w/o downstream users needing to know the details
 			private int                        _connectTimeoutMS;
