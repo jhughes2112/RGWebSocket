@@ -1,0 +1,9 @@
+# Throwaway test image: builds the whole solution and runs the ChatTest stress harness on Linux.
+# This validates the entire stack (including the managed HttpListener, which is a different implementation
+# than Windows' http.sys) in the same environment kubernetes pods actually run.  Use run_tests_docker.bat.
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+WORKDIR /src
+COPY . .
+RUN dotnet build RGWebSocket.sln -c Release
+ENTRYPOINT ["dotnet", "run", "--project", "ChatTest", "-c", "Release", "--no-build", "--"]
+CMD ["clients=32", "seed=12345"]

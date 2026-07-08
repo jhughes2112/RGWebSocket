@@ -29,6 +29,7 @@ namespace ReachableGames
 				private readonly string        _url;
 				private readonly Random        _rng;
 				private readonly ILogging _logger;
+				private readonly RGWebSocketConfig _wsConfig;
 				private readonly int           _startDelayMs;
 				private readonly int           _playMs;
 
@@ -44,11 +45,12 @@ namespace ReachableGames
 				public long   BinaryBytesReceived;
 				public string FatalError = null;
 
-				public ChatClient(string url, Random rng, ILogging logger, int startDelayMs, int playMs)
+				public ChatClient(string url, Random rng, ILogging logger, RGWebSocketConfig wsConfig, int startDelayMs, int playMs)
 				{
 					_url = url;
 					_rng = rng;
 					_logger = logger;
+					_wsConfig = wsConfig;
 					_startDelayMs = startDelayMs;
 					_playMs = playMs;
 					_shortId = Id.ToString().Substring(0, 8);
@@ -59,7 +61,7 @@ namespace ReachableGames
 					try
 					{
 						await Task.Delay(_startDelayMs).ConfigureAwait(false);
-						_uws = new UnityWebSocket(_logger, $"[client {_shortId}]", (uws) => Interlocked.Increment(ref DisconnectCallbacks), 5000);
+						_uws = new UnityWebSocket(_logger, $"[client {_shortId}]", (uws) => Interlocked.Increment(ref DisconnectCallbacks), 5000, _wsConfig);
 
 						int sessionCount = 1 + (_rng.NextDouble()<0.35 ? 1 : 0);  // 35% of clients reconnect for a second session
 						for (int s=0; s<sessionCount; s++)

@@ -59,8 +59,9 @@ ILogging logger = new ConsoleLogger();
 Action<UnityWebSocket> disconnectCallback = (UnityWebSocket uws) => { Console.WriteLine("Disconnected"); };
 int connectTimeoutMS = 3000;
 
-// Create a new WebSocket client instance
-UnityWebSocket client = new UnityWebSocket(logger, "Client", disconnectCallback, connectTimeoutMS);
+// Create a new WebSocket client instance.  RGWebSocketConfig carries all the tunable limits (buffer sizes,
+// inbound/outbound circuit breakers, idle disconnect); pass RGWebSocketConfig.Default if the defaults suit you.
+UnityWebSocket client = new UnityWebSocket(logger, "Client", disconnectCallback, connectTimeoutMS, RGWebSocketConfig.Default);
 
 // Connect to the WebSocket server
 Dictionary<string, string> headers = new Dictionary<string, string>();
@@ -112,8 +113,10 @@ int idleSeconds = 60;
 // responsible for closing them all if the server shuts down
 IConnectionManager connectionMgr = new YourConnectionManager();
 
-// Create a new WebSocket server instance on a port.  Ordinary HTTP requests can be handled too:
-WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger);
+// Create a new WebSocket server instance on a port.  RGWebSocketConfig carries all the tunable limits; a game
+// server probably wants the idle sweep on, so clients that vanish behind an Ingress get cleaned up:
+RGWebSocketConfig config = new RGWebSocketConfig() { IdleDisconnectSeconds = 300 };  // clients must heartbeat within 5 minutes
+WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, config);
 webServer.RegisterExactEndpoint("/status", async (context) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")));
 
 // Start listening.  This returns immediately; the listener runs on its own tasks.

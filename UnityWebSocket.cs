@@ -46,6 +46,7 @@ namespace ReachableGames
 			private volatile Status            _status = Status.ReadyToConnect;  // written on the socket's send thread (OnDisconnect), read on the main thread
 
 			private RGWebSocket?               _rgws;  // This should only be non-null when _status==Connected.
+			private RGWebSocketConfig          _config;
 			private ILogging                   _logger;
 			private string                     _loggerPrefix = "";
 			private string                     _lastErrorMsg = string.Empty;
@@ -77,13 +78,16 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(ILogging logger, string loggerPrefix, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS)
+			public UnityWebSocket(ILogging logger, string loggerPrefix, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS, RGWebSocketConfig config)
 			{
+				if (config==null)
+					throw new Exception("Cannot pass null in for config.  Pass RGWebSocketConfig.Default if you want the defaults.");
 				_logger = logger;
 				_loggerPrefix = loggerPrefix;
 				_disconnectCallback = disconnectCallback;
 				_connectTimeoutMS = connectTimeoutMS;
 				_connectUrl = string.Empty;
+				_config = config;
 			}
 
 			// Lets you specify where to connect to.
@@ -131,7 +135,7 @@ namespace ReachableGames
 						_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} http part");
 					}
 
-					_rgws = new RGWebSocket(null, OnReceive, OnDisconnect, _logger, uri.ToString(), wsClient);
+					_rgws = new RGWebSocket(null, OnReceive, OnDisconnect, _logger, uri.ToString(), wsClient, _config);
 					_status = Status.Connected;
 					_rgws.Start();  // pumps spin up only after everything is fully wired
 					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} rgws part");

@@ -84,9 +84,17 @@ namespace ReachableGames
 					PooledArray.Initialize(logger, 2000);  // warn if live buffer count runs away
 
 					//-------------------
-					// Server side
+					// Server side.  The config deliberately tightens the library limits so the tests can trip them quickly:
+					// 1MB inbound cap (phase 3 sends 2MB), 3s idle disconnect with a 1s sweep (phase 4 lurker goes silent).
+					RGWebSocketConfig config = new RGWebSocketConfig()
+					{
+						MaxInboundMessageBytes = 1*1024*1024,
+						MaxUnsentBytes         = 4*1024*1024,
+						IdleDisconnectSeconds  = 3,
+						IdleSweepPeriodSeconds = 1,
+					};
 					ChatConnectionManager mgr = new ChatConnectionManager(logger);
-					WebServer server = new WebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, logger);
+					WebServer server = new WebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, logger, config);
 					server.RegisterExactEndpoint("/status", (ctx) => Task.FromResult((200, "text/plain", System.Text.Encoding.UTF8.GetBytes($"connections={mgr.CurrentCount}"))));
 					try
 					{
@@ -106,7 +114,7 @@ namespace ReachableGames
 					Random master = new Random(seed);
 					List<ChatClient> clientList = new List<ChatClient>();
 					for (int i=0; i<clients; i++)
-						clientList.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, startDelayMs: master.Next(0, 1500), playMs: playMs + master.Next(-1000, 1500)));
+						clientList.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, RGWebSocketConfig.Default, startDelayMs: master.Next(0, 1500), playMs: playMs + master.Next(-1000, 1500)));
 
 					Console.WriteLine($"Spawning {clients} clients...");
 					long startedAt = Environment.TickCount64;
@@ -147,7 +155,7 @@ namespace ReachableGames
 						await zombie.SendAsync(new ArraySegment<byte>(iam), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
 						// ...and now the zombie never calls ReceiveAsync again.
 
-						UnityWebSocket flooder = new UnityWebSocket(logger, "[flooder]", null, 5000);
+						UnityWebSocket flooder = new UnityWebSocket(logger, "[flooder]", null, 5000, RGWebSocketConfig.Default);
 						await flooder.Connect($"ws://localhost:{port}/", new Dictionary<string, string>()).ConfigureAwait(false);
 						flooder.Send($"iam {Guid.NewGuid()}");
 						await Task.Delay(250).ConfigureAwait(false);  // let both register as members
@@ -190,14 +198,84 @@ namespace ReachableGames
 					}
 
 					//-------------------
-					// Phase 3: shut the server down WHILE clients are still connected and chatting.  This exercises
+					// Phase 3: inbound circuit breaker.  A client sends one 2MB message; the server's limit is configured at 1MB,
+					// so it should be disconnected mid-accumulation and the partial message never dispatched.
+					Console.WriteLine();
+					Console.WriteLine("Phase 3: oversize sender; server should disconnect a client that exceeds MaxInboundMessageBytes...");
+					bool oversizeDiscoed = false;
+					using (ClientWebSocket bloater = new ClientWebSocket())
+					{
+						await bloater.ConnectAsync(new Uri($"ws://localhost:{port}/"), CancellationToken.None).ConfigureAwait(false);
+						byte[] bloaterIam = System.Text.Encoding.UTF8.GetBytes($"iam {Guid.NewGuid()}");
+						await bloater.SendAsync(new ArraySegment<byte>(bloaterIam), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
+						await Task.Delay(250).ConfigureAwait(false);  // let it register (1 member)
+						try
+						{
+							byte[] huge = new byte[2*1024*1024];  // 2MB, double the configured 1MB inbound limit
+							huge[0] = 0xAB;
+							await bloater.SendAsync(new ArraySegment<byte>(huge), WebSocketMessageType.Binary, true, CancellationToken.None).ConfigureAwait(false);
+						}
+						catch (Exception)  // the server may reset the connection while we're mid-send; that IS the expected outcome
+						{
+						}
+						long p3deadline = Environment.TickCount64 + 10000;
+						while (mgr.CurrentCount>0 && Environment.TickCount64<p3deadline)
+							await Task.Delay(50).ConfigureAwait(false);
+						oversizeDiscoed = (mgr.CurrentCount==0);
+						Console.WriteLine($"Phase 3: oversize sender {(oversizeDiscoed ? "disconnected by server" : "NOT disconnected -- inbound limit did not trip")}");
+					}
+
+					//-------------------
+					// Phase 4: idle sweep.  A lurker connects, identifies, keeps READING (the TCP pipe is perfectly healthy), but never
+					// sends again.  With IdleDisconnectSeconds=3 the sweep should disconnect it -- this is the half-open/dead-client
+					// defense that transport-level idle timeouts fail to provide behind an Ingress.
+					Console.WriteLine();
+					Console.WriteLine("Phase 4: idle lurker (reads but never sends); the idle sweep should disconnect it...");
+					bool lurkerSwept = false;
+					long lurkerSweptMs = 0;
+					using (ClientWebSocket lurker = new ClientWebSocket())
+					{
+						await lurker.ConnectAsync(new Uri($"ws://localhost:{port}/"), CancellationToken.None).ConfigureAwait(false);
+						byte[] lurkerIam = System.Text.Encoding.UTF8.GetBytes($"iam {Guid.NewGuid()}");
+						await lurker.SendAsync(new ArraySegment<byte>(lurkerIam), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
+						long lurkerStart = Environment.TickCount64;
+						Task drainTask = Task.Run(async () =>  // stay alive and reading, completing the close handshake politely when it comes
+						{
+							byte[] buf = new byte[16*1024];
+							try
+							{
+								while (true)
+								{
+									WebSocketReceiveResult r = await lurker.ReceiveAsync(new ArraySegment<byte>(buf), CancellationToken.None).ConfigureAwait(false);
+									if (r.MessageType==WebSocketMessageType.Close)
+									{
+										await lurker.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None).ConfigureAwait(false);
+										break;
+									}
+								}
+							}
+							catch (Exception)  // aborts are also an acceptable way to die
+							{
+							}
+						});
+						long p4deadline = Environment.TickCount64 + 15000;
+						while (mgr.CurrentCount>0 && Environment.TickCount64<p4deadline)
+							await Task.Delay(100).ConfigureAwait(false);
+						lurkerSwept = (mgr.CurrentCount==0);
+						lurkerSweptMs = Environment.TickCount64 - lurkerStart;
+						Console.WriteLine($"Phase 4: lurker {(lurkerSwept ? $"swept in {lurkerSweptMs}ms (idle limit 3s + sweep period 1s)" : "NOT swept -- idle sweep failed")}");
+						await Task.WhenAny(drainTask, Task.Delay(3000)).ConfigureAwait(false);
+					}
+
+					//-------------------
+					// Phase 5: shut the server down WHILE clients are still connected and chatting.  This exercises
 					// ConnectionManager.Shutdown -> server-initiated close handshakes -> reaper drain, under load.
 					Console.WriteLine();
-					Console.WriteLine("Phase 3: spawning lingering clients, then shutting the server down underneath them...");
+					Console.WriteLine("Phase 5: spawning lingering clients, then shutting the server down underneath them...");
 					List<ChatClient> lingerers = new List<ChatClient>();
 					List<Task> lingerTasks = new List<Task>();
 					for (int i=0; i<8; i++)
-						lingerers.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, startDelayMs: 0, playMs: 60000));  // would chat for 60s if the server let them
+						lingerers.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, RGWebSocketConfig.Default, startDelayMs: 0, playMs: 60000));  // would chat for 60s if the server let them
 					foreach (ChatClient c in lingerers)
 						lingerTasks.Add(Task.Run(c.Run));
 					await Task.Delay(2000).ConfigureAwait(false);  // let them all connect and get chatty
@@ -210,7 +288,7 @@ namespace ReachableGames
 					Task allLingerers = Task.WhenAll(lingerTasks);
 					bool lingerersHung = (await Task.WhenAny(allLingerers, Task.Delay(15000)).ConfigureAwait(false)) != allLingerers;
 					int afterShutdownCount = mgr.CurrentCount;
-					Console.WriteLine($"Phase 3: server shutdown took {shutdownMs}ms with {connectedBeforeShutdown} clients connected; clients {(lingerersHung ? "HUNG" : "all exited")}; server tracks {afterShutdownCount}.");
+					Console.WriteLine($"Phase 5: server shutdown took {shutdownMs}ms with {connectedBeforeShutdown} clients connected; clients {(lingerersHung ? "HUNG" : "all exited")}; server tracks {afterShutdownCount}.");
 					clientList.AddRange(lingerers);  // fold their stats into the aggregate below
 
 					await Task.Delay(250).ConfigureAwait(false);
@@ -279,10 +357,12 @@ namespace ReachableGames
 					if (closeTimeouts>0)                        failures.Add($"{closeTimeouts} graceful closes timed out");
 					if (membersAtFloodStart!=2)                 failures.Add($"phase 2: expected zombie+flooder (2 members) at flood start, had {membersAtFloodStart}");
 					if (zombieDiscoed==false)                   failures.Add("phase 2: slow consumer was never disconnected -- the unsent-bytes circuit breaker did not trip");
-					if (connectedBeforeShutdown<8)              failures.Add($"phase 3 only had {connectedBeforeShutdown} clients connected at server shutdown (expected 8)");
-					if (lingerersHung)                          failures.Add("phase 3 clients did not exit within 15s of server shutdown");
-					if (afterShutdownCount>0)                   failures.Add($"phase 3: server still tracked {afterShutdownCount} connections after shutdown");
-					if (shutdownMs>10000)                       failures.Add($"phase 3: server shutdown took {shutdownMs}ms (expected well under 10s)");
+					if (oversizeDiscoed==false)                 failures.Add("phase 3: oversize sender was never disconnected -- the inbound message limit did not trip");
+					if (lurkerSwept==false)                     failures.Add("phase 4: idle lurker was never disconnected -- the idle sweep did not work");
+					if (connectedBeforeShutdown<8)              failures.Add($"phase 5 only had {connectedBeforeShutdown} clients connected at server shutdown (expected 8)");
+					if (lingerersHung)                          failures.Add("phase 5 clients did not exit within 15s of server shutdown");
+					if (afterShutdownCount>0)                   failures.Add($"phase 5: server still tracked {afterShutdownCount} connections after shutdown");
+					if (shutdownMs>10000)                       failures.Add($"phase 5: server shutdown took {shutdownMs}ms (expected well under 10s)");
 
 					if (failures.Count==0)
 					{

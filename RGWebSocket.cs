@@ -33,9 +33,7 @@ namespace ReachableGames
 			private Func<RGWebSocket, Task>                    _onDisconnectionCb;      // this must run straight through and NOT touch any tracking structures the RGWS might be added to.  This maybe called DURING the constructor!
 			private ILogging                             _logger;
 
-			private const int kRecvBufferSize     = 4096;         // buffer size for receiving chunks of messages
-			private const int kReallyBigMessage   = 1024*1024;    // we can handle messages bigger than this, but every time we have one bigger than this, we reset our internal receive array to free memory
-			private const int kMaxUnsentBytes     = 4*1024*1024;  // circuit breaker: a connection whose unsent queue exceeds this is too slow to keep up (dead client, saturated pipe, etc), so we disconnect it rather than hoard memory on its behalf.  This is intentionally a low-level, message-agnostic policy -- deciding which messages are discardable is an application-level concern that does not belong here.
+			private readonly RGWebSocketConfig _config;  // all tunable limits/buffer sizes live here -- see RGWebSocketConfig for the details and rationale of each knob
 
 			private AsyncAutoResetEvent      _releaseSendThread = new AsyncAutoResetEvent(false);  // this makes it easy to release the send thread when a new message is available
 			private CancellationTokenSource? _cancellationTokenSource = new CancellationTokenSource();
@@ -57,6 +55,7 @@ namespace ReachableGames
 			public long   _stats_recvBytes     { get; private set; }
 			public long   _stats_msgQueuedTime { get; private set; }
 			public int    _websocketState      { get { return (int)_webSocket!.State; } }
+			public long   _lastRecvTimestamp   { get; private set; }  // RAW Stopwatch.GetTimestamp() ticks, stamped every time ANY data arrives -- the cheapest possible liveness stamp (one clock read, one store, no unit conversion).  Compare against Stopwatch.GetTimestamp() and scale by Stopwatch.Frequency; the idle sweep does its one divide per pass, not per stamp.  Receiving is the only proof of liveness (sends just fill kernel buffers).  Deliberately not wall-clock: NTP corrections (common in containers/VMs) would make idle math jump around.
 			public string _lastError           { get { return _actualLastErr; } private set { _actualLastErr = value; } }
 			public bool   IsReadyForReaping    { get; private set; } = false;  // this is set true just before the OnDisconnect callback happens, because of the threaded nature of networking, it's useful to know it's already closed
 
@@ -83,7 +82,7 @@ namespace ReachableGames
 			// DisplayId is only a human-readable string, uniqueId is generated here but not used internally, and is guaranteed to increment every time a websocket is created, 
 			// and configuration for how to handle when the send is backed up. The cancellation source is a way for the caller to tear down the socket under any circumstances 
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
-			public RGWebSocket(HttpListenerContext? httpContext, Func<RGWebSocket, PooledArray, bool, Task> onReceiveMsg, Func<RGWebSocket, Task> onDisconnectionCb, ILogging logger, string displayId, WebSocket webSocket)
+			public RGWebSocket(HttpListenerContext? httpContext, Func<RGWebSocket, PooledArray, bool, Task> onReceiveMsg, Func<RGWebSocket, Task> onDisconnectionCb, ILogging logger, string displayId, WebSocket webSocket, RGWebSocketConfig config)
 			{
 				if (onReceiveMsg==null || onDisconnectionCb==null)
 					throw new Exception("Cannot pass null in for callbacks.");
@@ -91,12 +90,16 @@ namespace ReachableGames
 					throw new Exception("Cannot pass null in for webSocket.");
 				if (logger==null)
 					throw new Exception("Cannot pass null in for logger.");
+				if (config==null)
+					throw new Exception("Cannot pass null in for config.  Pass RGWebSocketConfig.Default if you want the defaults.");
 
+				_config = config;
 				_onReceiveMsgCb = onReceiveMsg;
 				_onDisconnectionCb = onDisconnectionCb;
 				_logger = logger;
 				_displayId = displayId;
 				_connectedAtTicks = DateTime.UtcNow.Ticks;
+				_lastRecvTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();  // a socket that never receives anything ages from its connection time
 				_httpContext = httpContext;
 				_webSocket = webSocket;
 
@@ -175,9 +178,9 @@ namespace ReachableGames
 					if (_cancellationTokenSource!=null && _cancellationTokenSource.IsCancellationRequested==false)
 					{
 						int unsentBytes = Interlocked.Add(ref _unsentBytes, binMsg.Length);
-						if (unsentBytes>kMaxUnsentBytes)  // slow consumer circuit breaker -- see kMaxUnsentBytes
+						if (unsentBytes>_config.MaxUnsentBytes)  // slow consumer circuit breaker -- see RGWebSocketConfig.MaxUnsentBytes
 						{
-							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {kMaxUnsentBytes}).  Disconnecting slow consumer.");
+							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {_config.MaxUnsentBytes}).  Disconnecting slow consumer.");
 							_cancellationTokenSource.Cancel();  // tears down both pumps; already-queued messages are drained and released by the send task's finally
 							return;  // this message is NOT queued (no IncRef happened) -- the connection is already dying
 						}
@@ -204,9 +207,9 @@ namespace ReachableGames
 					{
 						int byteCount = System.Text.Encoding.UTF8.GetByteCount(msg);
 						int unsentBytes = Interlocked.Add(ref _unsentBytes, byteCount);
-						if (unsentBytes>kMaxUnsentBytes)  // slow consumer circuit breaker -- see kMaxUnsentBytes
+						if (unsentBytes>_config.MaxUnsentBytes)  // slow consumer circuit breaker -- see RGWebSocketConfig.MaxUnsentBytes
 						{
-							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {kMaxUnsentBytes}).  Disconnecting slow consumer.");
+							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {_config.MaxUnsentBytes}).  Disconnecting slow consumer.");
 							_cancellationTokenSource.Cancel();  // tears down both pumps; already-queued messages are drained and released by the send task's finally
 							return;  // this message is NOT queued (nothing was borrowed) -- the connection is already dying
 						}
@@ -229,8 +232,8 @@ namespace ReachableGames
 			// This waits for data to show up, and when enough is collected, dispatch it to the app as a message buffer.
 			private async Task Recv(CancellationToken token)
 			{
-				byte[] recvBuffer = new byte[kRecvBufferSize];
-				List<byte> messageBytes = new List<byte>(kRecvBufferSize);  // start the buffer off with an allocation that is reasonable, to prevent a bunch of resizings
+				byte[] recvBuffer = new byte[_config.ReceiveBufferBytes];
+				List<byte> messageBytes = new List<byte>(_config.ReceiveBufferBytes);  // start the buffer off with an allocation that is reasonable, to prevent a bunch of resizings
 				while (token.IsCancellationRequested==false)  // this loop is structured so the status of the ws may change and we still process everything in the incoming buffer until we hit the close.  Hence the soft exit.
 				{
 					switch (_webSocket!.State)
@@ -257,6 +260,7 @@ namespace ReachableGames
 							try
 							{
 								WebSocketReceiveResult recvResult = await _webSocket.ReceiveAsync(new ArraySegment<byte>(recvBuffer), token).ConfigureAwait(false);
+								_lastRecvTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();  // ANY inbound frame proves the connection is alive; raw ticks, zero conversion cost
 
 								// I added a separate try/catch around user handler callbacks so errors in user code would not be able to cause this Task to exit.
 								if (recvResult!=null && recvResult.MessageType!=WebSocketMessageType.Close)
@@ -264,8 +268,14 @@ namespace ReachableGames
 									// assumption is that we don't get a mixture of binary and text for a single message
 									messageBytes.AddRange(new ArraySegment<byte>(recvBuffer, 0, recvResult.Count));
 
+									// Inbound circuit breaker -- see RGWebSocketConfig.MaxInboundMessageBytes.  Without this, one endless fragmented message OOMs the server.
+									if (messageBytes.Count > _config.MaxInboundMessageBytes)
+									{
+										SetLastError($"RGWSID={_displayId} inbound message hit {messageBytes.Count} bytes (limit {_config.MaxInboundMessageBytes}).  Disconnecting abusive sender.");
+										_cancellationTokenSource!.Cancel();  // exits both pumps; the partial message is never dispatched
+									}
 									// If we now have the whole message, dispatch it (synchronously).  Ignore the final close message though.
-									if (recvResult.EndOfMessage)
+									else if (recvResult.EndOfMessage)
 									{
 										// keep stats
 										_stats_recvMsgs++;
@@ -276,9 +286,9 @@ namespace ReachableGames
 										{
 											messageBytes.CopyTo(0, byteArray.data, 0, messageBytes.Count);
 											messageBytes.Clear();
-											if (messageBytes.Capacity > kReallyBigMessage)  // Since the messageBytes array is internal to the websocket and never resizes smaller on its own, we manually do this to prevent one REALLY BIG message pinning a ton of memory until the socket closes.
+											if (messageBytes.Capacity > _config.LargeMessageResetBytes)  // Since the messageBytes array is internal to the websocket and never resizes smaller on its own, we manually do this to prevent one REALLY BIG message pinning a ton of memory until the socket closes.
 											{
-												messageBytes.Capacity = kRecvBufferSize;  // reset this buffer to a reasonable size
+												messageBytes.Capacity = _config.ReceiveBufferBytes;  // reset this buffer to a reasonable size
 											}
 
 											try

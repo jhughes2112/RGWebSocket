@@ -24,7 +24,7 @@ namespace ReachableGames
 
 			//-------------------
 
-			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, ILogging logger)
+			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config)
 			{
 				_url                 = url;
 				_logger              = logger;
@@ -35,7 +35,7 @@ namespace ReachableGames
 				if (_urlPathPrefix.EndsWith("/", StringComparison.Ordinal)==false)
 					_urlPathPrefix += "/";
 
-				_httpServer = new WebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger);
+				_httpServer = new WebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger, config);
 			}
 
 			//-------------------

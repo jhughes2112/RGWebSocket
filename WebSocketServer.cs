@@ -13,6 +13,7 @@ using System.Net.WebSockets;
 using System.Diagnostics;
 using Logging;
 using Nito.AsyncEx;
+using Shared;
 
 namespace ReachableGames
 {
@@ -32,6 +33,7 @@ namespace ReachableGames
 			private OnHttpRequest             _httpRequestCallback;
 			private ILogging                  _logger;
 			private IConnectionManager        _connectionManager;
+			private RGWebSocketConfig         _config;
 
 			private Task                      _listenerUpdateTask = Task.CompletedTask;  // sleeps until one of the listeners finishes its work, then it creates a new one.  When _isRunning goes false, this exits.
 			private HttpListener              _listener = new HttpListener();  // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Close() on this, the listener stops but websockets do not abort.
@@ -41,16 +43,25 @@ namespace ReachableGames
 			private LockingList<RGWebSocket>  _reapQueue = new LockingList<RGWebSocket>();
 			private AsyncAutoResetEvent       _reaperWake = new AsyncAutoResetEvent(false);
 			private Task                      _reaperTask = Task.CompletedTask;
-			private CancellationTokenSource?  _reaperCancel = null;
+			private CancellationTokenSource?  _reaperCancel = null;  // also cancels the idle sweep -- they share a lifecycle
 			private int                       _pendingReaps = 0;  // sockets queued for reaping or mid-reap; StopListening waits for this to hit zero
 
+			// Idle sweep: every live socket is tracked here from Start() to disconnection.  A periodic task disconnects any socket that
+			// hasn't RECEIVED data within config.IdleDisconnectSeconds, because transport idle timeouts can't be trusted behind an L7
+			// proxy/Ingress (the proxy keeps its upstream connection warm, so the listener never sees the idleness).
+			private ThreadSafeDictionary<RGWebSocket, RGWebSocket> _liveSockets = new ThreadSafeDictionary<RGWebSocket, RGWebSocket>();
+			private Task                      _sweepTask = Task.CompletedTask;
+			private List<RGWebSocket>         _sweepWorking = new List<RGWebSocket>();  // only ever touched by the single sweep task
+
 			// httpRequest callback allows you to handle ordinary non-websocket HTTP requests however you want, even at the same url
-			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, ILogging logger)
+			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config)
 			{
 				if (logger==null)
 					throw new Exception("Logger may not be null.");
 				if (connectionManager == null)
 					throw new Exception("ConnectionManager may not be null.");
+				if (config==null)
+					throw new Exception("Config may not be null.  Pass RGWebSocketConfig.Default if you want the defaults.");
 				_listenerTasks       = listenerTasks;
 				_connectionMS        = connectionMS;
 				_prefixURL           = prefixURL;
@@ -58,6 +69,7 @@ namespace ReachableGames
 				_logger              = logger;
 				_connectionManager   = connectionManager;
 				_idleSeconds         = idleSeconds;
+				_config              = config;
 			}
 
 			public void Dispose()
@@ -82,6 +94,8 @@ namespace ReachableGames
 					_listener.Start();
 					_reaperCancel = new CancellationTokenSource();
 					_reaperTask = Task.Run(async () => await ReaperLoop(_reaperCancel.Token).ConfigureAwait(false));  // disposes dead sockets for the lifetime of the listener
+					if (_config.IdleDisconnectSeconds>0)
+						_sweepTask = Task.Run(async () => await IdleSweep(_reaperCancel.Token).ConfigureAwait(false));  // disconnects silent sockets, since transport idle timeouts can't be trusted
 					_listenerUpdateTask = Task.Run(async () => await ListenerUpdate(_listenerTasks).ConfigureAwait(false));  // simply run the listener in a separate thread, so any websocketserver has its own cpu time dedicated
 					_logger.Log(EVerbosity.Info, "WebSocketServer.Start");
 				}
@@ -114,6 +128,8 @@ namespace ReachableGames
 					{
 						_reaperCancel.Cancel();
 						await _reaperTask.ConfigureAwait(false);  // the reaper does one final sweep on the way out
+						await _sweepTask.ConfigureAwait(false);
+						_sweepTask = Task.CompletedTask;
 						_reaperCancel.Dispose();
 						_reaperCancel = null;
 					}
@@ -138,6 +154,35 @@ namespace ReachableGames
 					await ReapAll().ConfigureAwait(false);
 				}
 				await ReapAll().ConfigureAwait(false);  // final sweep, in case anything was queued while we were being told to exit
+			}
+
+			//-------------------
+			// Wakes up periodically and disconnects any socket that hasn't received data within the configured window.  Receiving is
+			// the only proof of liveness -- successful sends just fill kernel buffers -- so clients are expected to heartbeat more often
+			// than IdleDisconnectSeconds.  Close() is graceful and its teardown is bounded even when the peer is truly gone.
+			private async Task IdleSweep(CancellationToken token)
+			{
+				while (token.IsCancellationRequested==false)
+				{
+					try
+					{
+						await Task.Delay(_config.IdleSweepPeriodSeconds*1000, token).ConfigureAwait(false);
+					}
+					catch (OperationCanceledException)  // not an error, flow control
+					{
+						break;
+					}
+					// All the unit conversion happens HERE, once per sweep pass -- the per-frame stamp in RGWebSocket is just a raw clock read.
+					long idleTimestampTicks = _config.IdleDisconnectSeconds * Stopwatch.Frequency;
+					long now = Stopwatch.GetTimestamp();  // monotonic, immune to the NTP clock corrections that are common in containers/VMs
+					_liveSockets.Foreach((rgws, unused) => { if (now - rgws._lastRecvTimestamp > idleTimestampTicks) _sweepWorking.Add(rgws); });  // collect under the read lock, act outside it
+					for (int i=0; i<_sweepWorking.Count; i++)
+					{
+						_logger.Log(EVerbosity.Warning, $"WebSocketServer.IdleSweep disconnecting {_sweepWorking[i]._displayId} (nothing received for over {_config.IdleDisconnectSeconds}s)");
+						_sweepWorking[i].Close();
+					}
+					_sweepWorking.Clear();
+				}
 			}
 
 			private List<RGWebSocket> _reapWorking = new List<RGWebSocket>();  // only ever touched by the single reaper task
@@ -274,15 +319,17 @@ namespace ReachableGames
 							// Note, we hook our own OnReceive/OnDisconnect before proxying it on to the ConnectionManager.  The constructor is inert:
 							// the connection manager gets to register the socket FIRST, and only then does Start() spin up the pumps, so no
 							// callback can ever race the registration.
-							RGWebSocket rgws = new RGWebSocket(httpContext, OnReceive, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
+							RGWebSocket rgws = new RGWebSocket(httpContext, OnReceive, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, _config);
 							try
 							{
 								await _connectionManager.OnConnection(rgws, httpContext).ConfigureAwait(false);
+								_liveSockets.Add(rgws, rgws);  // tracked for the idle sweep; removed in OnDisconnection
 								rgws.Start();
 								_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - websocket detected.  Upgrade completed. {rgws._displayId}");
 							}
 							catch
 							{
+								_liveSockets.Remove(rgws);
 								await rgws.Shutdown().ConfigureAwait(false);  // the manager rejected it (threw), so dispose the never-started socket cleanly
 								throw;
 							}
@@ -364,6 +411,7 @@ namespace ReachableGames
 					// Hand the socket to the reaper for final disposal.  We are running ON this socket's send task right now, so awaiting
 					// rgws.Shutdown() here would deadlock waiting for ourselves.  The reaper shuts it down from outside instead.
 					_logger.Log(EVerbosity.Debug, $"WebSocketServer.OnDisconnection queued for reaping {rgws._displayId}");
+					_liveSockets.Remove(rgws);  // no longer a candidate for the idle sweep
 					Interlocked.Increment(ref _pendingReaps);
 					_reapQueue.Add(rgws);
 					_reaperWake.Set();
