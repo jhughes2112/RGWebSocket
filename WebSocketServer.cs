@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using System.Net.WebSockets;
 using System.Diagnostics;
 using Logging;
+using Nito.AsyncEx;
 
 namespace ReachableGames
 {
@@ -34,6 +35,14 @@ namespace ReachableGames
 
 			private Task                      _listenerUpdateTask = Task.CompletedTask;  // sleeps until one of the listeners finishes its work, then it creates a new one.  When _isRunning goes false, this exits.
 			private HttpListener              _listener = new HttpListener();  // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Close() on this, the listener stops but websockets do not abort.
+
+			// Dead websockets are handed to the reaper task for final Shutdown(), because RGWebSocket's onDisconnection callback runs
+			// ON the socket's own send task -- awaiting Shutdown() there would be waiting for yourself to finish.  The reaper does it from outside.
+			private LockingList<RGWebSocket>  _reapQueue = new LockingList<RGWebSocket>();
+			private AsyncAutoResetEvent       _reaperWake = new AsyncAutoResetEvent(false);
+			private Task                      _reaperTask = Task.CompletedTask;
+			private CancellationTokenSource?  _reaperCancel = null;
+			private int                       _pendingReaps = 0;  // sockets queued for reaping or mid-reap; StopListening waits for this to hit zero
 
 			// httpRequest callback allows you to handle ordinary non-websocket HTTP requests however you want, even at the same url
 			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, ILogging logger)
@@ -71,6 +80,8 @@ namespace ReachableGames
 					_listener.Prefixes.Add(_prefixURL);
 					_listener.TimeoutManager.IdleConnection = TimeSpan.FromSeconds(_idleSeconds);  // idle connections are cut after this long -- note, this doesn't affect websockets at all.
 					_listener.Start();
+					_reaperCancel = new CancellationTokenSource();
+					_reaperTask = Task.Run(async () => await ReaperLoop(_reaperCancel.Token).ConfigureAwait(false));  // disposes dead sockets for the lifetime of the listener
 					_listenerUpdateTask = Task.Run(async () => await ListenerUpdate(_listenerTasks).ConfigureAwait(false));  // simply run the listener in a separate thread, so any websocketserver has its own cpu time dedicated
 					_logger.Log(EVerbosity.Info, "WebSocketServer.Start");
 				}
@@ -92,7 +103,60 @@ namespace ReachableGames
 					await _listenerUpdateTask.ConfigureAwait(false);  // wait until all the listener tasks have exited
 					_listener.Close();  // dispose the listener
 					await _connectionManager.Shutdown().ConfigureAwait(false);  // disconnect all existing RGWS connections
+
+					// Every disconnect lands in the reaper queue; wait until the reaper has disposed them all, so shutdown is deterministic.
+					long deadline = Environment.TickCount64 + 5000;
+					while (Volatile.Read(ref _pendingReaps)>0 && Environment.TickCount64<deadline)
+						await Task.Delay(20).ConfigureAwait(false);
+					if (Volatile.Read(ref _pendingReaps)>0)
+						_logger.Log(EVerbosity.Warning, $"WebSocketServer.StopListening: {_pendingReaps} sockets still unreaped after 5s");
+					if (_reaperCancel!=null)
+					{
+						_reaperCancel.Cancel();
+						await _reaperTask.ConfigureAwait(false);  // the reaper does one final sweep on the way out
+						_reaperCancel.Dispose();
+						_reaperCancel = null;
+					}
 					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening Complete");
+				}
+			}
+
+			//-------------------
+			// Runs for the lifetime of the listener.  Disposes dead sockets from outside their own task context, so RGWebSocket.Shutdown
+			// never waits on itself no matter how the disconnect happened.
+			private async Task ReaperLoop(CancellationToken token)
+			{
+				while (token.IsCancellationRequested==false)
+				{
+					try
+					{
+						await _reaperWake.WaitAsync(token).ConfigureAwait(false);
+					}
+					catch (OperationCanceledException)  // not an error, flow control
+					{
+					}
+					await ReapAll().ConfigureAwait(false);
+				}
+				await ReapAll().ConfigureAwait(false);  // final sweep, in case anything was queued while we were being told to exit
+			}
+
+			private async Task ReapAll()
+			{
+				RGWebSocket? rgws;
+				while ((rgws = _reapQueue.PopFront())!=null)
+				{
+					try
+					{
+						await rgws.Shutdown().ConfigureAwait(false);
+					}
+					catch (Exception e)
+					{
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.ReapAll {rgws._displayId} {e}");
+					}
+					finally
+					{
+						Interlocked.Decrement(ref _pendingReaps);
+					}
 				}
 			}
 
@@ -205,26 +269,46 @@ namespace ReachableGames
 							HttpListenerWebSocketContext webSocketContext = await httpContext.AcceptWebSocketAsync(null, TimeSpan.FromSeconds(1)).WaitAsync(upgradeTimeout.Token).ConfigureAwait(false);
 							_logger.Log(EVerbosity.Debug, "WebSocketServer.HandleConnection - websocket detected.  Upgraded.");
 
-							// Note, we hook our own OnReceive/OnDisconnect before proxying it on to the ConnectionManager.  Note, due to heavy congestion and C# scheduling, it's entirely possible that this is already a closed socket, and is immediately flagged for destruction.
+							// Note, we hook our own OnReceive/OnDisconnect before proxying it on to the ConnectionManager.  The constructor is inert:
+							// the connection manager gets to register the socket FIRST, and only then does Start() spin up the pumps, so no
+							// callback can ever race the registration.
 							RGWebSocket rgws = new RGWebSocket(httpContext, OnReceive, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
-							if (rgws.IsReadyForReaping==false)
+							try
 							{
 								await _connectionManager.OnConnection(rgws, httpContext).ConfigureAwait(false);
+								rgws.Start();
 								_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - websocket detected.  Upgrade completed. {rgws._displayId}");
+							}
+							catch
+							{
+								await rgws.Shutdown().ConfigureAwait(false);  // the manager rejected it (threw), so dispose the never-started socket cleanly
+								throw;
 							}
 						}
 					}
 					catch (OperationCanceledException ex)  // timeout
 					{
 						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - websocket upgrade timeout {ex}");
-						httpContext.Response.StatusCode = 500;
-						httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
+						try
+						{
+							httpContext.Response.StatusCode = 500;
+							httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
+						}
+						catch (Exception)  // HttpListenerResponse throws if the upgrade already touched it; the connection is dead either way
+						{
+						}
 					}
 					catch (Exception ex)// anything else
 					{
 						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - websocket upgrade exception {ex}");
-						httpContext.Response.StatusCode = 500;
-						httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
+						try
+						{
+							httpContext.Response.StatusCode = 500;
+							httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
+						}
+						catch (Exception)  // HttpListenerResponse throws if the upgrade already touched it; the connection is dead either way
+						{
+						}
 					}
 				}
 				else  // let the application specify what the HTTP response is, but we do the async write here to free up the app to do other things
@@ -235,7 +319,7 @@ namespace ReachableGames
 						using (CancellationTokenSource responseTimeout = new CancellationTokenSource(timeoutMS))
 						{
 							// Remember to set httpContext.Response.StatusCode, httpContext.Response.ContentLength64, and httpContenxtResponse.OutputStream
-							await _httpRequestCallback(httpContext).ConfigureAwait(false);
+							await _httpRequestCallback(httpContext).WaitAsync(responseTimeout.Token).ConfigureAwait(false);  // a handler that overruns the timeout gets abandoned and the connection closed
 						}
 					}
 					catch (OperationCanceledException ex)  // timeout
@@ -275,15 +359,12 @@ namespace ReachableGames
 				}
 				finally
 				{
-					_logger.Log(EVerbosity.Debug, $"WebSocketServer.OnDisconnection finally {rgws._displayId}");
-					try
-					{
-						await rgws.Shutdown().ConfigureAwait(false);  // give C# scheduler just a moment to transition tasks status from "running" to "completed", because it always looks completed in the debugger with a breakpoint here.
-					}
-					catch (Exception e)
-					{
-						_logger.Log(EVerbosity.Error, $"WebSocketServer.OnDisconnection {rgws._displayId} {e}");
-					}
+					// Hand the socket to the reaper for final disposal.  We are running ON this socket's send task right now, so awaiting
+					// rgws.Shutdown() here would deadlock waiting for ourselves.  The reaper shuts it down from outside instead.
+					_logger.Log(EVerbosity.Debug, $"WebSocketServer.OnDisconnection queued for reaping {rgws._displayId}");
+					Interlocked.Increment(ref _pendingReaps);
+					_reapQueue.Add(rgws);
+					_reaperWake.Set();
 				}
 			}
 		}

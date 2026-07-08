@@ -18,7 +18,8 @@ namespace ReachableGames
 		public class WebServer
 		{
 			private readonly string              _url;
-			private readonly string              _urlPath;  // if this server is hosted at http://some.com/foo/bar then this variable will contain foo/bar for easy removal
+			private readonly string              _urlPath;        // if this server is hosted at http://some.com/foo/bar then this variable will contain foo/bar for easy removal
+			private readonly string              _urlPathPrefix;  // "/foo/bar/" form of the above, for prefix-stripping request paths
 			private readonly ILogging            _logger;
 			private WebSocketServer              _httpServer;
 
@@ -31,6 +32,9 @@ namespace ReachableGames
 
 				string[] urlParts = url.Split('/');  // When you have a url, you have protocol://domain:port/path/part/etc
 				_urlPath          = string.Join('/', urlParts, 3, urlParts.Length-3);  // this leaves you with path/part/etc
+				_urlPathPrefix    = "/" + _urlPath;
+				if (_urlPathPrefix.EndsWith("/", StringComparison.Ordinal)==false)
+					_urlPathPrefix += "/";
 
 				_httpServer = new WebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger);
 			}
@@ -135,8 +139,17 @@ namespace ReachableGames
 				string  responseContentType = "text/plain";
 				byte[]? responseContent = null;
 
+				// Strip the hosting prefix off the FRONT of the path only.  (string.Replace would also mangle it if it appeared mid-path,
+				// e.g. hosting at /api would break a request for /api/api-docs.)
 				string path = httpContext.Request.Url?.AbsolutePath ?? string.Empty;
-				string relativeEndpoint = string.IsNullOrEmpty(_urlPath) ? path : path.Replace(_urlPath, string.Empty);
+				string relativeEndpoint = path;
+				if (_urlPathPrefix.Length>1)
+				{
+					if (path.StartsWith(_urlPathPrefix, StringComparison.Ordinal))
+						relativeEndpoint = path.Substring(_urlPathPrefix.Length-1);  // keep the leading slash, e.g. /foo/metrics -> /metrics
+					else if (path.Length==_urlPathPrefix.Length-1 && _urlPathPrefix.StartsWith(path, StringComparison.Ordinal))
+						relativeEndpoint = "/";  // a request for the hosting root itself, without the trailing slash
+				}
 				
 				HTTPRequestHandler? handler = null;
 				
@@ -166,9 +179,11 @@ namespace ReachableGames
 					}
 					catch (Exception e)
 					{
+						// Log the details, but never send exception text (stack frames, paths, internals) to whoever is on the other end of the socket.
+						_logger.Log(EVerbosity.Error, $"Exception in endpoint handler {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
 						responseCode = 500;
 						responseContentType = "text/plain";
-						responseContent = System.Text.Encoding.UTF8.GetBytes($"Exception {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
+						responseContent = System.Text.Encoding.UTF8.GetBytes("500 Internal Server Error");
 					}
 				}
 				else

@@ -130,8 +130,28 @@ namespace ReachableGames
 						Console.WriteLine($"HTTP GET /status -> \"{await http.GetStringAsync($"http://localhost:{port}/status").ConfigureAwait(false)}\"");
 
 					//-------------------
-					// Shut the server down and check for leaks.
+					// Phase 2: shut the server down WHILE clients are still connected and chatting.  This exercises
+					// ConnectionManager.Shutdown -> server-initiated close handshakes -> reaper drain, under load.
+					Console.WriteLine();
+					Console.WriteLine("Phase 2: spawning lingering clients, then shutting the server down underneath them...");
+					List<ChatClient> lingerers = new List<ChatClient>();
+					List<Task> lingerTasks = new List<Task>();
+					for (int i=0; i<8; i++)
+						lingerers.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, startDelayMs: 0, playMs: 60000));  // would chat for 60s if the server let them
+					foreach (ChatClient c in lingerers)
+						lingerTasks.Add(Task.Run(c.Run));
+					await Task.Delay(2000).ConfigureAwait(false);  // let them all connect and get chatty
+					int connectedBeforeShutdown = mgr.CurrentCount;
+
+					long shutdownStart = Environment.TickCount64;
 					await server.Shutdown().ConfigureAwait(false);
+					long shutdownMs = Environment.TickCount64 - shutdownStart;
+
+					Task allLingerers = Task.WhenAll(lingerTasks);
+					bool lingerersHung = (await Task.WhenAny(allLingerers, Task.Delay(15000)).ConfigureAwait(false)) != allLingerers;
+					int afterShutdownCount = mgr.CurrentCount;
+					Console.WriteLine($"Phase 2: server shutdown took {shutdownMs}ms with {connectedBeforeShutdown} clients connected; clients {(lingerersHung ? "HUNG" : "all exited")}; server tracks {afterShutdownCount}.");
+					clientList.AddRange(lingerers);  // fold their stats into the aggregate below
 
 					await Task.Delay(250).ConfigureAwait(false);
 					GC.Collect();
@@ -197,6 +217,10 @@ namespace ReachableGames
 					if (liveAllocs>1)                           failures.Add($"PooledArray leak: {liveAllocs} live buffers (expected 1)");
 					if (welcomes!=sessions)                     failures.Add($"welcomes ({welcomes}) != sessions ({sessions}) -- lost or duplicated handshakes");
 					if (closeTimeouts>0)                        failures.Add($"{closeTimeouts} graceful closes timed out");
+					if (connectedBeforeShutdown<8)              failures.Add($"phase 2 only had {connectedBeforeShutdown} clients connected at server shutdown (expected 8)");
+					if (lingerersHung)                          failures.Add("phase 2 clients did not exit within 15s of server shutdown");
+					if (afterShutdownCount>0)                   failures.Add($"phase 2: server still tracked {afterShutdownCount} connections after shutdown");
+					if (shutdownMs>10000)                       failures.Add($"phase 2: server shutdown took {shutdownMs}ms (expected well under 10s)");
 
 					if (failures.Count==0)
 					{

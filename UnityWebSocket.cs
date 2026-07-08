@@ -43,7 +43,7 @@ namespace ReachableGames
 			private string                     _connectUrl;           // caching the connection params so Reconnect is possible w/o downstream users needing to know the details
 			private int                        _connectTimeoutMS;
 			private Dictionary<string, string> _connectHeaders = new Dictionary<string, string>();
-			private Status                     _status = Status.ReadyToConnect;
+			private volatile Status            _status = Status.ReadyToConnect;  // written on the socket's send thread (OnDisconnect), read on the main thread
 
 			private RGWebSocket?               _rgws;  // This should only be non-null when _status==Connected.
 			private ILogging                   _logger;
@@ -107,6 +107,8 @@ namespace ReachableGames
 			{
 				if (_status!=Status.ReadyToConnect)
 					throw new Exception("Not in status=ReadyToConnect.");
+				if (_rgws!=null)
+					Shutdown();  // the previous connection ended remotely and was never explicitly Shutdown; dispose it so Connect/Reconnect doesn't leak it
 
 				_lastErrorMsg = string.Empty;
 				Uri uri = new Uri(_connectUrl);  // I think this can throw exceptions for bad formatting?
@@ -129,33 +131,21 @@ namespace ReachableGames
 						_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} http part");
 					}
 
-					_status = Status.Connected;
 					_rgws = new RGWebSocket(null, OnReceive, OnDisconnect, _logger, uri.ToString(), wsClient);
+					_status = Status.Connected;
+					_rgws.Start();  // pumps spin up only after everything is fully wired
 					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} rgws part");
 				}
-				catch (AggregateException age)
+				catch (OperationCanceledException)  // await unwraps exceptions, so the timeout arrives directly (no AggregateException)
 				{
-					if (age.InnerException is OperationCanceledException)
-					{
-						_lastErrorMsg = "Connection timed out.";
-						_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
-					}
-					else if (age.InnerException is WebSocketException)
-					{
-						_lastErrorMsg = ((WebSocketException)age.InnerException).Message;
-						_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
-					}
-					else
-					{
-						_lastErrorMsg = age.Message;
-						_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
-					}
+					_lastErrorMsg = "Connection timed out.";
+					_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
 					wsClient.Dispose();  // cleanup
 					Shutdown();  // this just resets everything so we can try connecting again
 				}
 				catch (Exception e)
 				{
-					_lastErrorMsg = e.Message;
+					_lastErrorMsg = e.Message;  // WebSocketException and friends all carry a useful Message
 					_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
 					wsClient.Dispose();  // cleanup
 					Shutdown();  // this just resets everything so we can try connecting again

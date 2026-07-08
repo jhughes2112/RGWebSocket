@@ -1,5 +1,5 @@
-#nullable enable
-﻿//-------------------
+﻿#nullable enable
+//-------------------
 // Reachable Games
 // Copyright 2023
 //-------------------
@@ -41,6 +41,9 @@ namespace ReachableGames
 			private Task?                    _sendTask;
 			private Task?                    _recvTask;
 			private string                   _actualLastErr = string.Empty;
+			private bool                     _started = false;       // Start() may only be called once
+			private int                      _shutdownStarted = 0;   // interlocked flag: the first Shutdown() caller does the work, everyone else awaits _shutdownDone
+			private TaskCompletionSource<bool> _shutdownDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 			
 			// Basic metrics
 			public string _displayId           { get; private set; }  // good for troubleshooting
@@ -96,12 +99,22 @@ namespace ReachableGames
 				_httpContext = httpContext;
 				_webSocket = webSocket;
 
-				_recvTask = Task.Run(async () => await Recv(_cancellationTokenSource.Token).ConfigureAwait(false));
-				_sendTask = Task.Run(async () => await Send(_cancellationTokenSource.Token).ConfigureAwait(false));
+				// NOTE: the constructor is pure wiring -- nothing runs and no callbacks can fire until Start() is called.
 
 #if RGWS_LOGGING
 				_logger.Log(EVerbosity.Extreme, $"{_displayId} RGWebSocket constructor");
 #endif
+			}
+
+			// Kicks off the send/recv pumps.  Call this exactly once, AFTER the socket is registered wherever it needs to be tracked.
+			// Because nothing happens until this is called, there is no longer any race where onDisconnection fires during construction.
+			public void Start()
+			{
+				if (_started)
+					throw new Exception($"RGWebSocket.Start may only be called once. RGWSID={_displayId}");
+				_started = true;
+				_recvTask = Task.Run(async () => await Recv(_cancellationTokenSource!.Token).ConfigureAwait(false));
+				_sendTask = Task.Run(async () => await Send(_cancellationTokenSource!.Token).ConfigureAwait(false));
 			}
 
 			// This is called by this program when we want to close the websocket.
@@ -111,36 +124,44 @@ namespace ReachableGames
 				Send(sCloseOutputAsync);
 			}
 
-			// This is an optional call where you want to shutdown the websocket but don't want to do so via Disconnected callback.  Just await this, then call Dispose.
+			// Tears down the socket: cancels the pumps, waits for them to exit, then disposes everything exactly once.
+			// Idempotent and thread-safe: the first caller does the work, every other caller (concurrent or later) awaits the same completion.
+			// Do NOT call this from inside the onDisconnection callback -- that callback runs ON the send task, which would be waiting
+			// for itself to finish.  Hand the socket to a reaper instead, the way WebSocketServer does.
 			public async Task Shutdown()
 			{
 #if RGWS_LOGGING
 				_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} Shutdown called.");
 #endif
-
-				if (_cancellationTokenSource!=null && _cancellationTokenSource.IsCancellationRequested==false)
+				if (Interlocked.Exchange(ref _shutdownStarted, 1)==0)
 				{
-					// If we don't wait for the tasks to complete, it throws an exception trying to dispose them, and probably leaves them running forever.
-					_cancellationTokenSource.Cancel();      // kills the Recv and Send tasks
-					await Task.WhenAll(_sendTask!, _recvTask!).ConfigureAwait(false);
-
-					// Stops the Tasks, breaks the websocket connection and drops all the held resources.
-					// Final teardown happens here, after the caller has been told of the disconnection.
-					_recvTask?.Dispose();
-					_sendTask?.Dispose();
-					_recvTask = null;
-					_sendTask = null;
-					_webSocket?.Dispose();  // never null out the _webSocket or tasks
-					_webSocket = null;
-					_httpContext?.Response.Close();  // in the client/Unity case, httpContext is null
-					_httpContext = null;
-					_cancellationTokenSource.Dispose();
-					_cancellationTokenSource = null;
-
+					try
+					{
+						_cancellationTokenSource!.Cancel();  // kills the Recv and Send tasks
+						if (_sendTask!=null && _recvTask!=null)  // never Start()ed?  Then there are no pumps to wait for.
+							await Task.WhenAll(_sendTask, _recvTask).ConfigureAwait(false);  // the pumps swallow their own exceptions, so this does not throw
+					}
+					finally
+					{
+						// Break the websocket connection and drop all the held resources.  Note we intentionally do NOT call Task.Dispose()
+						// (unnecessary, and it has a history of throwing depending on task status), and we do NOT null the fields out,
+						// so stragglers reading _websocketState or _lastError after shutdown get sane answers instead of exceptions.
+						_webSocket!.Dispose();
+						try
+						{
+							_httpContext?.Response.Close();  // in the client/Unity case, httpContext is null.  Must be closed or the .NET internals leak tracking data.
+						}
+						catch (Exception)  // HttpListenerResponse is badly behaved if anything already touched it; nothing useful can be done here
+						{
+						}
+						_cancellationTokenSource!.Dispose();  // safe: IsCancellationRequested still reads true after disposal, which is all Send() looks at
+						_shutdownDone.TrySetResult(true);
 #if RGWS_LOGGING
-					_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} Shutdown completed.");
+						_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} Shutdown completed.");
 #endif
+					}
 				}
+				await _shutdownDone.Task.ConfigureAwait(false);  // every caller returns only when teardown has genuinely finished
 			}
 
 			// Thread-friendly way to send any message to the remote client.
@@ -264,8 +285,9 @@ namespace ReachableGames
 							catch (OperationCanceledException)  // not an error, flow control
 							{
 							}
-							catch (WebSocketException)  // happens when the client closes the connection without completing the handshake.  Whatever.
+							catch (WebSocketException)  // happens when the peer vanishes without completing the handshake.  Terminal for the socket, so shut down instead of risking a hot loop on a broken pipe.
 							{
+								_cancellationTokenSource!.Cancel();  // exits this task and kills the Send task
 							}
 							catch (Exception ex)  // if connection is prematurely closed, we get an exception from ReceiveAsync.
 							{
