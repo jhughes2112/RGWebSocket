@@ -8,13 +8,14 @@
 //
 //   dotnet run --project ChatTest -- clients=24 seed=12345 port=9696 playms=3500 verbose=0
 //
-// verbose: 0=Error 1=Warning 2=Info 3=Debug 4=ExtremelyVerbose
+// verbose: 0=Error 1=Warning 2=Info 3=Debug 4=Extreme
 
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Logging;
 
 namespace ReachableGames
 {
@@ -22,29 +23,45 @@ namespace ReachableGames
 	{
 		namespace ChatTest
 		{
-			public static class Program
+			// Simple console logger.  Note: RGWebSocket logs transport errors (aborted sockets etc.) at Error level,
+			// and abrupt client deaths make some of those EXPECTED here, so we count them rather than fail on them.
+			public class ConsoleLogger : ILogging
 			{
-				static private ELogVerboseType _verbosity = ELogVerboseType.Error;
-				static private object _consoleLock = new object();
-				static private int    _loggedErrors = 0;
+				private object _lock = new object();
+				private int    _errors = 0;
 
-				// Note: RGWebSocket logs transport errors (aborted sockets etc.) at Error level.  Abrupt client deaths make some of those EXPECTED here.
-				static public void Log(ELogVerboseType level, string msg)
+				public EVerbosity Verbosity { get; set; }
+				public int        ErrorCount => _errors;
+
+				public ConsoleLogger(EVerbosity verbosity)
 				{
-					if (level==ELogVerboseType.Error)
-						Interlocked.Increment(ref _loggedErrors);
-					if (level>_verbosity)
+					Verbosity = verbosity;
+				}
+
+				public void Log(EVerbosity level, string msg)
+				{
+					if (level==EVerbosity.Error)
+						Interlocked.Increment(ref _errors);
+					if (level>Verbosity)
 						return;
-					lock (_consoleLock)
+					lock (_lock)
 						Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}][{level}] {msg}");
 				}
 
+				public void Dispose()
+				{
+				}
+			}
+
+			public static class Program
+			{
 				public static async Task<int> Main(string[] args)
 				{
 					int clients = 24;
 					int seed    = Environment.TickCount;
 					int port    = 9696;
 					int playMs  = 3500;
+					EVerbosity verbosity = EVerbosity.Error;
 					foreach (string arg in args)
 					{
 						string[] kv = arg.Split('=');
@@ -55,27 +72,28 @@ namespace ReachableGames
 							case "seed":    seed    = int.Parse(kv[1]); break;
 							case "port":    port    = int.Parse(kv[1]); break;
 							case "playms":  playMs  = int.Parse(kv[1]); break;
-							case "verbose": _verbosity = (ELogVerboseType)int.Parse(kv[1]); break;
+							case "verbose": verbosity = (EVerbosity)int.Parse(kv[1]); break;
 						}
 					}
-					Console.WriteLine($"ChatTest starting: clients={clients} seed={seed} port={port} playms={playMs} verbose={_verbosity}");
+					Console.WriteLine($"ChatTest starting: clients={clients} seed={seed} port={port} playms={playMs} verbose={verbosity}");
 					Console.WriteLine($"(reproduce this exact run with: dotnet run --project ChatTest -- clients={clients} seed={seed} port={port} playms={playMs})");
 					Console.WriteLine();
 
-					PooledArray.Initialize(Log, 2000);  // warn if live buffer count runs away
+					ConsoleLogger logger = new ConsoleLogger(verbosity);
+					PooledArray.Initialize(logger, 2000);  // warn if live buffer count runs away
 
 					//-------------------
 					// Server side
-					ChatConnectionManager mgr = new ChatConnectionManager(Log);
-					WebServer server = new WebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, Log);
-					server.RegisterEndpoint("/status", (ctx) => Task.FromResult((200, "text/plain", System.Text.Encoding.UTF8.GetBytes($"connections={mgr.CurrentCount}"))));
-
-					Task serverTask = server.Start();
-					await Task.Delay(500).ConfigureAwait(false);
-					if (serverTask.IsCompleted)  // WebServer.Start logs and returns on listener failure (e.g. port conflict) rather than throwing
+					ChatConnectionManager mgr = new ChatConnectionManager(logger);
+					WebServer server = new WebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, logger);
+					server.RegisterExactEndpoint("/status", (ctx) => Task.FromResult((200, "text/plain", System.Text.Encoding.UTF8.GetBytes($"connections={mgr.CurrentCount}"))));
+					try
 					{
-						Console.WriteLine("FAIL: server exited immediately on startup (port conflict or ACL issue?)");
-						await serverTask.ConfigureAwait(false);
+						server.Start();
+					}
+					catch (Exception e)
+					{
+						Console.WriteLine($"FAIL: server could not start (port conflict or ACL issue?) {e.Message}");
 						return 1;
 					}
 
@@ -87,7 +105,7 @@ namespace ReachableGames
 					Random master = new Random(seed);
 					List<ChatClient> clientList = new List<ChatClient>();
 					for (int i=0; i<clients; i++)
-						clientList.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), Log, startDelayMs: master.Next(0, 1500), playMs: playMs + master.Next(-1000, 1500)));
+						clientList.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, startDelayMs: master.Next(0, 1500), playMs: playMs + master.Next(-1000, 1500)));
 
 					Console.WriteLine($"Spawning {clients} clients...");
 					long startedAt = Environment.TickCount64;
@@ -113,15 +131,13 @@ namespace ReachableGames
 
 					//-------------------
 					// Shut the server down and check for leaks.
-					server.Shutdown();
-					if ((await Task.WhenAny(serverTask, Task.Delay(10000)).ConfigureAwait(false)) != serverTask)
-						Console.WriteLine("WARN: server did not stop within 10s of Shutdown()");
+					await server.Shutdown().ConfigureAwait(false);
 
 					await Task.Delay(250).ConfigureAwait(false);
 					GC.Collect();
 					GC.WaitForPendingFinalizers();
 					GC.Collect();
-					long liveAllocs   = PooledArray.GetLiveAllocs();
+					long liveAllocs    = PooledArray.GetLiveAllocs();
 					long liveAllocSize = PooledArray.GetLiveAllocSize();
 
 					//-------------------
@@ -160,7 +176,7 @@ namespace ReachableGames
 					Console.WriteLine($"Chat binary:          sent={binariesSent} received={binariesReceived} ({Utilities.BytesToHumanReadable(binaryBytes)}) corrupt={binaryCorrupt}");
 					Console.WriteLine($"Client-visible errs:  serverErrors={serverErrors} (whisper misses are normal) unknownMsgs={unknownMsgs} clientFatals={fatals}");
 					Console.WriteLine(mgr.StatsString());
-					Console.WriteLine($"Logged Error lines:   {_loggedErrors} (abrupt deaths make some of these expected)");
+					Console.WriteLine($"Logged Error lines:   {logger.ErrorCount} (abrupt deaths make some of these expected)");
 					Console.WriteLine($"PooledArray live:     {liveAllocs} buffers / {Utilities.BytesToHumanReadable(liveAllocSize)} (expected: 1 buffer / 128B -- the close sentinel)");
 					Console.WriteLine();
 

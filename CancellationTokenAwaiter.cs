@@ -1,3 +1,4 @@
+#nullable enable
 ﻿//-------------------
 // Nabbed from Medium.com:
 // https://medium.com/@cilliemalan/how-to-await-a-cancellation-token-in-c-cbfc88f28fa2

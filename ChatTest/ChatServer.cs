@@ -1,4 +1,4 @@
-//-------------------
+﻿//-------------------
 // Reachable Games
 // Copyright 2026
 //-------------------
@@ -13,6 +13,7 @@
 //   server -> client:  "error <details>"        anything the server didn't like
 
 using System;
+using Logging;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Threading;
@@ -28,7 +29,7 @@ namespace ReachableGames
 			{
 				private ConcurrentDictionary<RGWebSocket, Guid> _sockets = new ConcurrentDictionary<RGWebSocket, Guid>();  // every live socket, Guid.Empty until it identifies
 				private ConcurrentDictionary<Guid, RGWebSocket> _members = new ConcurrentDictionary<Guid, RGWebSocket>();  // only identified members
-				private OnLogDelegate _logger;
+				private ILogging _logger;
 
 				// Stats -- all bumped with Interlocked because callbacks arrive on per-socket recv threads.
 				private long _connections, _disconnections, _textMsgs, _binaryMsgs, _broadcasts, _whispers, _whisperMisses, _listRequests, _protocolErrors;
@@ -37,7 +38,7 @@ namespace ReachableGames
 				public long Connections      => Interlocked.Read(ref _connections);
 				public long Disconnections   => Interlocked.Read(ref _disconnections);
 
-				public ChatConnectionManager(OnLogDelegate logger)
+				public ChatConnectionManager(ILogging logger)
 				{
 					_logger = logger;
 				}
@@ -46,7 +47,7 @@ namespace ReachableGames
 				{
 					_sockets.TryAdd(rgws, Guid.Empty);
 					Interlocked.Increment(ref _connections);
-					_logger(ELogVerboseType.Debug, $"ChatServer: connection {rgws._displayId} (now {_sockets.Count})");
+					_logger.Log(EVerbosity.Debug, $"ChatServer: connection {rgws._displayId} (now {_sockets.Count})");
 					return Task.CompletedTask;
 				}
 
@@ -55,7 +56,7 @@ namespace ReachableGames
 					if (_sockets.TryRemove(rgws, out Guid id) && id!=Guid.Empty)
 						_members.TryRemove(id, out _);
 					Interlocked.Increment(ref _disconnections);
-					_logger(ELogVerboseType.Debug, $"ChatServer: disconnect {rgws._displayId} (now {_sockets.Count})");
+					_logger.Log(EVerbosity.Debug, $"ChatServer: disconnect {rgws._displayId} (now {_sockets.Count})");
 					return Task.CompletedTask;
 				}
 
@@ -136,7 +137,7 @@ namespace ReachableGames
 					while (_sockets.Count>0 && Environment.TickCount64<deadline)
 						await Task.Delay(50).ConfigureAwait(false);
 					if (_sockets.Count>0)
-						_logger(ELogVerboseType.Warning, $"ChatServer.Shutdown: {_sockets.Count} sockets still tracked after 5s of waiting");
+						_logger.Log(EVerbosity.Warning, $"ChatServer.Shutdown: {_sockets.Count} sockets still tracked after 5s of waiting");
 				}
 
 				public string StatsString()

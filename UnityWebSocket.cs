@@ -1,3 +1,4 @@
+#nullable enable
 ﻿//-------------------
 // Reachable Games
 // Copyright 2023
@@ -10,6 +11,7 @@ using System.Net.WebSockets;
 using System.Threading.Tasks;
 using System.Threading;
 using System.Collections.Generic;
+using Logging;
 
 namespace ReachableGames
 {
@@ -28,11 +30,13 @@ namespace ReachableGames
 				Connected,
 			}
 
-			// Supports strings or binary messages on the websocket.  If binMsg is null, it's a string.
+			// Supports strings or binary messages on the websocket.  Both kinds live in the same pooled buffer; isText tells you which.
+			// ALL messages must be disposed by the consumer to return the buffer to the pool.  Use .Text to decode a text payload when you want the string.
 			public struct wsMessage
 			{
-				public string      stringMsg;
-				public PooledArray binMsg;
+				public PooledArray msg;     // the payload bytes; dispose when done
+				public bool        isText;  // true = UTF8 text payload
+				public string Text => System.Text.Encoding.UTF8.GetString(msg.data, 0, msg.Length);  // decode helper, only pay for the string when you ask for it
 			}
 			private LockingList<wsMessage>     _incomingMessages = new LockingList<wsMessage>();
 
@@ -41,8 +45,8 @@ namespace ReachableGames
 			private Dictionary<string, string> _connectHeaders = new Dictionary<string, string>();
 			private Status                     _status = Status.ReadyToConnect;
 
-			private RGWebSocket                _rgws;  // This should only be non-null when _status==Connected.
-			private OnLogDelegate              _logger;
+			private RGWebSocket?               _rgws;  // This should only be non-null when _status==Connected.
+			private ILogging                   _logger;
 			private string                     _loggerPrefix = "";
 			private string                     _lastErrorMsg = string.Empty;
 			private Action<UnityWebSocket>     _disconnectCallback;
@@ -73,18 +77,13 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(OnLogDelegate logger, string loggerPrefix, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS)
+			public UnityWebSocket(ILogging logger, string loggerPrefix, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS)
 			{
 				_logger = logger;
 				_loggerPrefix = loggerPrefix;
 				_disconnectCallback = disconnectCallback;
 				_connectTimeoutMS = connectTimeoutMS;
-			}
-
-			// Use this function to automatically include the loggerPrefix on each message.
-			private void Log(ELogVerboseType type, string message)
-			{
-				_logger(type, $"{_loggerPrefix} {message}");
+				_connectUrl = string.Empty;
 			}
 
 			// Lets you specify where to connect to.
@@ -113,10 +112,9 @@ namespace ReachableGames
 				Uri uri = new Uri(_connectUrl);  // I think this can throw exceptions for bad formatting?
 
 				// Creates a websocket connection and lets you start sending or receiving messages on separate threads.
-				ClientWebSocket wsClient = null;
+				ClientWebSocket wsClient = new ClientWebSocket();
 				try
 				{
-					wsClient = new ClientWebSocket();
 					wsClient.Options.KeepAliveInterval = Timeout.InfiniteTimeSpan;  // disable the keepalive ping/pong on websocket protocol
 					using (CancellationTokenSource connectTimeout = new CancellationTokenSource(_connectTimeoutMS))
 					{
@@ -128,38 +126,38 @@ namespace ReachableGames
 
 						_status = Status.Connecting;
 						await wsClient.ConnectAsync(uri, connectTimeout.Token).ConfigureAwait(false);
-						Log(ELogVerboseType.Warning, $"UWS Connected to {uri} http part");
+						_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} http part");
 					}
 
 					_status = Status.Connected;
-					_rgws = new RGWebSocket(null, OnReceiveText, OnReceiveBinary, OnDisconnect, _logger, uri.ToString(), wsClient);
-					Log(ELogVerboseType.Warning, $"UWS Connected to {uri} rgws part");
+					_rgws = new RGWebSocket(null, OnReceive, OnDisconnect, _logger, uri.ToString(), wsClient);
+					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} rgws part");
 				}
 				catch (AggregateException age)
 				{
 					if (age.InnerException is OperationCanceledException)
 					{
 						_lastErrorMsg = "Connection timed out.";
-						Log(ELogVerboseType.Error, _lastErrorMsg);
+						_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
 					}
 					else if (age.InnerException is WebSocketException)
 					{
 						_lastErrorMsg = ((WebSocketException)age.InnerException).Message;
-						Log(ELogVerboseType.Error, _lastErrorMsg);
+						_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
 					}
 					else
 					{
 						_lastErrorMsg = age.Message;
-						Log(ELogVerboseType.Error, _lastErrorMsg);
+						_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
 					}
-					wsClient?.Dispose();  // cleanup
+					wsClient.Dispose();  // cleanup
 					Shutdown();  // this just resets everything so we can try connecting again
 				}
 				catch (Exception e)
 				{
 					_lastErrorMsg = e.Message;
-					Log(ELogVerboseType.Error, _lastErrorMsg);
-					wsClient?.Dispose();  // cleanup
+					_logger.Log(EVerbosity.Error, $"{_loggerPrefix} {_lastErrorMsg}");
+					wsClient.Dispose();  // cleanup
 					Shutdown();  // this just resets everything so we can try connecting again
 				}
 			}
@@ -169,8 +167,8 @@ namespace ReachableGames
 			{
 				if (_status==Status.Connected)
 				{
-					_rgws.Close();
-					Log(ELogVerboseType.Warning, "UWS Closed.");
+					_rgws!.Close();
+					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Closed.");
 				}
 			}
 
@@ -182,7 +180,7 @@ namespace ReachableGames
 					RGWebSocket rgws = _rgws;  // prevent recursion here in shutdown
 					_rgws = null;
 					rgws.Shutdown().Wait();
-					Log(ELogVerboseType.Warning, "UWS connection reset.");
+					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS connection reset.");
 				}
 				_status = Status.ReadyToConnect;
 			}
@@ -192,15 +190,15 @@ namespace ReachableGames
 			{
 				if (_status == Status.Connected)
 				{
-					_rgws.Send(msg);
+					_rgws!.Send(msg);
 #if RGWS_LOGGING
-					Log(ELogVerboseType.Debug, $"UWS Sent {msg.Length} bytes");
+					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Sent {msg.Length} bytes");
 #endif
 					return true;
 				}
 				else
 				{
-					Log(ELogVerboseType.Debug, $"UWS Send called but status is {_status}");
+					_logger.Log(EVerbosity.Error, $"{_loggerPrefix} UWS Send called but status is {_status}");
 				}
 				return false;
 			}
@@ -210,21 +208,21 @@ namespace ReachableGames
 			{
 				if (_status == Status.Connected)
 				{
-					_rgws.Send(msg);
+					_rgws!.Send(msg);
 #if RGWS_LOGGING
-					Log(ELogVerboseType.Debug, $"UWS Sent {msg.Length} bytes");
+					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Sent {msg.Length} bytes");
 #endif
 					return true;
 				}
 				else
 				{
-					Log(ELogVerboseType.Debug, $"UWS Send called but status is {_status}");
+					_logger.Log(EVerbosity.Error, $"{_loggerPrefix} UWS Send called but status is {_status}");
 				}
 				return false;
 			}
 
 			// This is intended for you to grab all the messages that have been sent, in bulk and from the main thread, like in an MonoBehaviour.Update() method.
-			// NOTE: Any binary messages will need DecRef() called on them to return them to the byte array pool.  You own these messages now!
+			// NOTE: EVERY message (text and binary alike) must be disposed to return its buffer to the pool.  You own these messages now!
 			public void ReceiveAll(List<wsMessage> messageList)
 			{
 				// Take the whole set of incoming messages, lock it, then move it to messageList and clear it out
@@ -233,22 +231,13 @@ namespace ReachableGames
 
 			//-------------------
 			// Privates.  These calls occur on non-main-threads, so messages get queued up and you POLL them out in the Receive call above on the main thread.
-			private Task OnReceiveText(RGWebSocket rgws, string msg)
-			{
-				_incomingMessages.Add(new wsMessage() { stringMsg = msg, binMsg = null });
-#if RGWS_LOGGING
-				Log(ELogVerboseType.Debug, $"UWS Recv {msg.Length} bytes txt");
-#endif
-				return Task.CompletedTask;
-			}
-
-			// This callback holds the reference to PooledArray, so it must be decremented to free it (eventually) after it's consumed.
-			private Task OnReceiveBinary(RGWebSocket rgws, PooledArray msg)
+			// This callback holds a reference to the PooledArray, so the consumer must dispose it to free the buffer (eventually) after it's consumed.
+			private Task OnReceive(RGWebSocket rgws, PooledArray msg, bool isText)
 			{
 				msg.IncRef();  // bump the refcount since we aren't done with it yet, and RGWebSocket can decrement it without freeing the buffer
-				_incomingMessages.Add(new wsMessage() { stringMsg = string.Empty, binMsg = msg });
+				_incomingMessages.Add(new wsMessage() { msg = msg, isText = isText });
 #if RGWS_LOGGING
-				Log(ELogVerboseType.Debug, $"UWS Recv {msg.Length} bytes binary.  IncomingMessages={_incomingMessages.Count}");
+				_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Recv {msg.Length} bytes {(isText ? "text" : "binary")}.  IncomingMessages={_incomingMessages.Count}");
 #endif
 				return Task.CompletedTask;
 			}
@@ -257,7 +246,7 @@ namespace ReachableGames
 			// However, it is possible that the Recv/Send threads shutdown before the RGWS constructor is even finished 
 			private Task OnDisconnect(RGWebSocket rgws)
 			{
-				Log(ELogVerboseType.Warning, "UWS Disconnected.");
+				_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Disconnected.");
 				_status = Status.ReadyToConnect;
 				_disconnectCallback?.Invoke(this);  // This callback needs to NOT modify any tracking structures, because it may be called as early as DURING the RGWS constructor.  Just set flags
 				return Task.CompletedTask;

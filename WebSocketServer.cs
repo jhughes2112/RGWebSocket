@@ -1,3 +1,4 @@
+#nullable enable
 ﻿//-------------------
 // Reachable Games
 // Copyright 2023
@@ -10,6 +11,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Net.WebSockets;
 using System.Diagnostics;
+using Logging;
+using Nito.AsyncEx;
 
 namespace ReachableGames
 {
@@ -27,14 +30,14 @@ namespace ReachableGames
 			private int                       _idleSeconds;
 			private string                    _prefixURL;
 			private OnHttpRequest             _httpRequestCallback;
-			private OnLogDelegate             _logger;
+			private ILogging                  _logger;
 			private IConnectionManager        _connectionManager;
 
 			private Task                      _listenerUpdateTask = Task.CompletedTask;  // sleeps until one of the listeners finishes its work, then it creates a new one.  When _isRunning goes false, this exits.
-			private HttpListener              _listener = null;  // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Stop() on this, they all abort.
+			private HttpListener              _listener = new HttpListener();  // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Close() on this, the listener stops but websockets do not abort.
 
 			// httpRequest callback allows you to handle ordinary non-websocket HTTP requests however you want, even at the same url
-			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, OnLogDelegate logger)
+			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, ILogging logger)
 			{
 				if (logger==null)
 					throw new Exception("Logger may not be null.");
@@ -51,50 +54,47 @@ namespace ReachableGames
 
 			public void Dispose()
 			{
-				if (_listener!=null)
-					StopListening().GetAwaiter().GetResult();  // block
-				_logger(ELogVerboseType.Info, $"WebSocketServer.Dispose");
+				StopListening().GetAwaiter().GetResult();  // block
+				_logger.Log(EVerbosity.Info, $"WebSocketServer.Dispose");
 			}
+
+			public bool IsListening() { return _listener.IsListening; }
 
 			public void StartListening()
 			{
-				if (_listener!=null)
+				if (IsListening())
 					throw new Exception("WebSocketServer.StartListening should not be called twice without StopListening");
 
 				// Kick off the listener update task.  It makes sure there are always _maxCount listener threads available to accept incoming connections.
 				try
 				{
-					_listener = new HttpListener();
+					_listener.Prefixes.Clear();
 					_listener.Prefixes.Add(_prefixURL);
 					_listener.TimeoutManager.IdleConnection = TimeSpan.FromSeconds(_idleSeconds);  // idle connections are cut after this long -- note, this doesn't affect websockets at all.
 					_listener.Start();
-					_listenerUpdateTask = ListenerUpdate(_listenerTasks);
-					_logger(ELogVerboseType.Info, "WebSocketServer.Start");
+					_listenerUpdateTask = Task.Run(async () => await ListenerUpdate(_listenerTasks).ConfigureAwait(false));  // simply run the listener in a separate thread, so any websocketserver has its own cpu time dedicated
+					_logger.Log(EVerbosity.Info, "WebSocketServer.Start");
 				}
 				catch (HttpListenerException e)
 				{
-					_logger(ELogVerboseType.Error, $"WebSocketServer.StartListening exception (usually port conflict) {e.ErrorCode} {e}");
+					_logger.Log(EVerbosity.Error, $"WebSocketServer.StartListening exception (usually port conflict) {e.ErrorCode} {e}");
 					throw;  // rethrow it, there's nothing we can do here
 				}
 			}
 
-			// Blocks until the listener task is torn down.  This ABORTS current connections.
+			// Blocks until the listener task is torn down.  Drains out the connection manager, then aborts any remaining connections.
 			public async Task StopListening()
 			{
-				if (_listener!=null && _listener.IsListening)
+				if (_listener.IsListening)
 				{
-					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening ConnectionManager.Shutdown");
+					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening Listener.Close");
+					_listener.Stop();  // cancel everything
+					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening ConnectionManager.Shutdown");
+					await _listenerUpdateTask.ConfigureAwait(false);  // wait until all the listener tasks have exited
+					_listener.Close();  // dispose the listener
 					await _connectionManager.Shutdown().ConfigureAwait(false);  // disconnect all existing RGWS connections
-					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening Listener.Stop");
-					_listener.Stop();  // this sets all WebSocket statuses = ABORTED.  However, this causes ObjectDisposedException when it doesn't Start properly.
-					await _listenerUpdateTask.ConfigureAwait(false);
-					_listenerUpdateTask.Dispose();
-					_listenerUpdateTask = Task.CompletedTask;
-					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening Listener.Close");
-					_listener.Close();
-					_logger(ELogVerboseType.Info, "WebSocketServer.StopListening Complete");
+					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening Complete");
 				}
-				_listener = null;
 			}
 
 			//-------------------
@@ -109,9 +109,12 @@ namespace ReachableGames
 					// Initialize the listener task count
 					for (int i=0; i<numListenerTasks; i++)
 					{
-						Task<HttpListenerContext> t = _listener.GetContextAsync();
-						listenerTasks.Add(t);
-						_logger(ELogVerboseType.Debug, "WebSocketServer.ListenerUpdate - adding listener");
+						if (_listener.IsListening)
+						{
+							Task<HttpListenerContext> t = _listener.GetContextAsync();
+							listenerTasks.Add(t);
+							_logger.Log(EVerbosity.Extreme, "WebSocketServer.ListenerUpdate - adding listener");
+						}
 					}
 
 					while (_listener.IsListening)  // loop forever until canceled
@@ -123,23 +126,29 @@ namespace ReachableGames
 							// Note, listenerTasks is used for BOTH listening and for tasks that run for websockets and regular HTTP requests
 							// Which is why sometimes it is a Task<HttpListenerContext> and sometimes is just a regular Task that needs to be disposed when it completes.
 							// That's also why we don't want to add new listener tasks except when the task /was/ a listener that just completed.  Otherwise the number of listener tasks will grow.
-							Task<HttpListenerContext> connectTask = t as Task<HttpListenerContext>;
-							if (connectTask != null)
+							if (t is Task<HttpListenerContext> connectTask)
 							{
-								_logger(ELogVerboseType.Debug, $"WebSocketServer.ListenerUpdate - listener handled {connectTask.Status}");
+								_logger.Log(EVerbosity.Extreme, $"WebSocketServer.ListenerUpdate - listener handled {connectTask.Status}");
 
 								// replace the listener task that just finished if the socket listener is still running
 								if (_listener.IsListening)
 								{
-									Task newListener = _listener.GetContextAsync();
-									listenerTasks.Add(newListener);
+									try
+									{
+										Task newListener = _listener.GetContextAsync();
+										listenerTasks.Add(newListener);
+									}
+									catch (ObjectDisposedException)
+									{
+										// Listener closed between IsListening check and GetContextAsync; ignore and allow loop to exit.
+									}
 								}
 
 								// If the connection was valid, go ahead and handle the request
 								if (connectTask.IsCompletedSuccessfully)
 								{
 									// Actually handle the connection
-									HttpListenerContext connectContext = connectTask.GetAwaiter().GetResult();  // this task is already complete, so it does not block
+									HttpListenerContext connectContext = await connectTask.ConfigureAwait(false);  // this task is already complete, so it does not block
 									Task connectionTask = HandleConnection(connectContext);
 									listenerTasks.Add(connectionTask);
 								}
@@ -150,13 +159,17 @@ namespace ReachableGames
 				catch (OperationCanceledException)  // if the token is cancelled, we pop to here
 				{
 				}
+				catch (ObjectDisposedException)
+				{
+					// Listener disposed during shutdown; treat as normal exit path.
+				}
 				catch (Exception e)
 				{
-					_logger(ELogVerboseType.Error, $"WebSocketServer.ListenerUpdate - caught unexpected exception {e}");
+					_logger.Log(EVerbosity.Error, $"WebSocketServer.ListenerUpdate - caught unexpected exception {e}");
 				}
 				finally
 				{
-					_logger(ELogVerboseType.Debug, "WebSocketServer.ListenerUpdate - disposing listener tasks");
+					_logger.Log(EVerbosity.Extreme, "WebSocketServer.ListenerUpdate - disposing listener tasks");
 
 					// Give them all one second to finish aborting.
 					using (Task waitingForAll = Task.WhenAll(listenerTasks))
@@ -171,7 +184,7 @@ namespace ReachableGames
 						{
 						}
 					}
-					_logger(ELogVerboseType.Debug, "WebSocketServer.ListenerUpdate - listener tasks dead");
+					_logger.Log(EVerbosity.Extreme, "WebSocketServer.ListenerUpdate - listener tasks dead");
 				}
 			}
 
@@ -186,31 +199,31 @@ namespace ReachableGames
 					// Kick off an async task to upgrade the web socket and do send/recv messaging, but fail if it takes more than a second to finish.
 					try
 					{
-						_logger(ELogVerboseType.Info, "WebSocketServer.HandleConnection - websocket detected.  Upgrading connection.");
+						_logger.Log(EVerbosity.Info, "WebSocketServer.HandleConnection - websocket detected.  Upgrading connection.");
 						using (CancellationTokenSource upgradeTimeout = new CancellationTokenSource(timeoutMS))
 						{
 							// The TimeSpan is supposed to be the websocket keepalives.  But does not appear to affect anything. I would disable keepalives if I could.
-							HttpListenerWebSocketContext webSocketContext = await httpContext.AcceptWebSocketAsync(null, TimeSpan.FromSeconds(1)).WaitAsync(upgradeTimeout.Token);
-							_logger(ELogVerboseType.Debug, "WebSocketServer.HandleConnection - websocket detected.  Upgraded.");
+							HttpListenerWebSocketContext webSocketContext = await httpContext.AcceptWebSocketAsync(null, TimeSpan.FromSeconds(1)).WaitAsync(upgradeTimeout.Token).ConfigureAwait(false);
+							_logger.Log(EVerbosity.Debug, "WebSocketServer.HandleConnection - websocket detected.  Upgraded.");
 
-							// Note, we hook our own OnDisconnect before proxying it on to the ConnectionManager.  Note, due to heavy congestion and C# scheduling, it's entirely possible that this is already a closed socket, and is immediately flagged for destruction.
-							RGWebSocket rgws = new RGWebSocket(httpContext, _connectionManager.OnReceiveText, _connectionManager.OnReceiveBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
+							// Note, we hook our own OnReceive/OnDisconnect before proxying it on to the ConnectionManager.  Note, due to heavy congestion and C# scheduling, it's entirely possible that this is already a closed socket, and is immediately flagged for destruction.
+							RGWebSocket rgws = new RGWebSocket(httpContext, OnReceive, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
 							if (rgws.IsReadyForReaping==false)
 							{
 								await _connectionManager.OnConnection(rgws, httpContext).ConfigureAwait(false);
-								_logger(ELogVerboseType.Debug, $"WebSocketServer.HandleConnection - websocket detected.  Upgrade completed. {rgws._displayId}");
+								_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - websocket detected.  Upgrade completed. {rgws._displayId}");
 							}
 						}
 					}
 					catch (OperationCanceledException ex)  // timeout
 					{
-						_logger(ELogVerboseType.Error, $"WebSocketServer.HandleConnection - websocket upgrade timeout {ex}");
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - websocket upgrade timeout {ex}");
 						httpContext.Response.StatusCode = 500;
 						httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
 					}
 					catch (Exception ex)// anything else
 					{
-						_logger(ELogVerboseType.Error, $"WebSocketServer.HandleConnection - websocket upgrade exception {ex}");
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - websocket upgrade exception {ex}");
 						httpContext.Response.StatusCode = 500;
 						httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
 					}
@@ -219,7 +232,7 @@ namespace ReachableGames
 				{
 					try
 					{
-						_logger(ELogVerboseType.Debug, $"WebSocketServer.HandleConnection - normal http request {httpContext.Request.RawUrl}");
+						_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - normal http request {httpContext.Request.RawUrl}");
 						using (CancellationTokenSource responseTimeout = new CancellationTokenSource(timeoutMS))
 						{
 							// Remember to set httpContext.Response.StatusCode, httpContext.Response.ContentLength64, and httpContenxtResponse.OutputStream
@@ -228,11 +241,11 @@ namespace ReachableGames
 					}
 					catch (OperationCanceledException ex)  // timeout
 					{
-						_logger(ELogVerboseType.Error, $"WebSocketServer.HandleConnection - http callback cancelled {ex}");
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - http callback cancelled {ex}");
 					}
 					catch (Exception ex) // anything else
 					{
-						_logger(ELogVerboseType.Error, $"WebSocketServer.HandleConnection - http callback handler exception {ex}");
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - http callback handler exception {ex}");
 					}
 					finally
 					{
@@ -241,28 +254,36 @@ namespace ReachableGames
 				}
 			}
 
+			// The core delivers text messages as UTF8 bytes in a pooled buffer; decode here at the edge, since IConnectionManager wants strings for text.
+			private Task OnReceive(RGWebSocket rgws, PooledArray msg, bool isText)
+			{
+				if (isText)
+					return _connectionManager.OnReceiveText(rgws, System.Text.Encoding.UTF8.GetString(msg.data, 0, msg.Length));
+				return _connectionManager.OnReceiveBinary(rgws, msg);
+			}
+
 			// Add this websocket to the list of those we need to remove and unblock the cleanup thread
 			private async Task OnDisconnection(RGWebSocket rgws)
 			{
-				_logger(ELogVerboseType.Debug, $"{rgws._displayId} OnDisconnection call.");
+				_logger.Log(EVerbosity.Debug, $"{rgws._displayId} OnDisconnection call.");
 				try
 				{
 					await _connectionManager.OnDisconnect(rgws).ConfigureAwait(false);  // let the connection manager know it's disconnected now
 				}
 				catch (Exception e)
 				{
-					_logger(ELogVerboseType.Error, $"WebSocketServer.OnDisconnection Exception: {rgws._displayId} {e.Message}");
+					_logger.Log(EVerbosity.Error, $"WebSocketServer.OnDisconnection Exception: {rgws._displayId} {e.Message}");
 				}
 				finally
 				{
-					_logger(ELogVerboseType.Debug, $"WebSocketServer.OnDisconnection finally {rgws._displayId}");
+					_logger.Log(EVerbosity.Debug, $"WebSocketServer.OnDisconnection finally {rgws._displayId}");
 					try
 					{
 						await rgws.Shutdown().ConfigureAwait(false);  // give C# scheduler just a moment to transition tasks status from "running" to "completed", because it always looks completed in the debugger with a breakpoint here.
 					}
 					catch (Exception e)
 					{
-						_logger(ELogVerboseType.Error, $"WebSocketServer.OnDisconnection {rgws._displayId} {e}");
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.OnDisconnection {rgws._displayId} {e}");
 					}
 				}
 			}

@@ -1,17 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>ReachableGames.RGWebSocket</RootNamespace>
     <ApplicationIcon>reachablegames.ico</ApplicationIcon>
-    <Copyright>Copyright 2023 Reachable Games LLC</Copyright>
-    <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 7, suitable for servers.</Description>
+    <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
+    <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 10, suitable for servers.</Description>
     <PackageIcon>reachablegames.png</PackageIcon>
     <SignAssembly>true</SignAssembly>
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 	
-	<VersionSuffix>1.0.25</VersionSuffix>
+	<VersionSuffix>1.0.26</VersionSuffix>
 	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
 	<Version>$(VersionSuffix)</Version>
 	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
@@ -45,6 +45,10 @@
   <ItemGroup>
     <Compile Include="..\CancellationTokenAwaiter.cs" Link="CancellationTokenAwaiter.cs" />
     <Compile Include="..\IConnectionManager.cs" Link="IConnectionManager.cs" />
+    <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
+    <Compile Include="..\LockingList.cs" Link="LockingList.cs" />
+    <Compile Include="..\PooledArray.cs" Link="PooledArray.cs" />
+    <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
     <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
     <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />

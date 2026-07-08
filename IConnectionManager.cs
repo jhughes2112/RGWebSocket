@@ -1,3 +1,4 @@
+#nullable enable
 ﻿//-------------------
 // Reachable Games
 // Copyright 2023

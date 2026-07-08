@@ -1,12 +1,13 @@
+#nullable enable
 ﻿//-------------------
 // Reachable Games
 // Copyright 2023
 //-------------------
 
+using Logging;
 using System;
 using System.Collections.Generic;
 using System.Net;
-using System.Threading;
 using System.Threading.Tasks;
 
 namespace ReachableGames
@@ -18,79 +19,53 @@ namespace ReachableGames
 		{
 			private readonly string              _url;
 			private readonly string              _urlPath;  // if this server is hosted at http://some.com/foo/bar then this variable will contain foo/bar for easy removal
-			private readonly int                 _listenerThreads;
-			private readonly int                 _connectionTimeoutMS;
-			private readonly int                 _idleSeconds;
-			private readonly OnLogDelegate       _logger;
-			private readonly IConnectionManager  _connectionManager;
-			private CancellationTokenSource      _cancellationTokenSrc = null;  // this gets allocated and destroyed based on server status being listening or not.
+			private readonly ILogging            _logger;
+			private WebSocketServer              _httpServer;
 
 			//-------------------
 
-			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, OnLogDelegate logger)
+			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, ILogging logger)
 			{
 				_url                 = url;
-				_listenerThreads     = listenerThreads;
-				_connectionTimeoutMS = connectionTimeoutMS;
-				_idleSeconds         = idleSeconds;
-				_connectionManager   = connectionManager;
 				_logger              = logger;
 
 				string[] urlParts = url.Split('/');  // When you have a url, you have protocol://domain:port/path/part/etc
 				_urlPath          = string.Join('/', urlParts, 3, urlParts.Length-3);  // this leaves you with path/part/etc
+
+				_httpServer = new WebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger);
 			}
 
 			//-------------------
 
-			public async Task Start()
+			public void Start()
 			{
-				if (_cancellationTokenSrc!=null)
-					throw new Exception("WebServer cannot be started multiple times without Shutdown being called.");
+				if (_httpServer.IsListening())
+					throw new Exception("WebServer.Start is already listening at {_url}");
 
-				_cancellationTokenSrc = new CancellationTokenSource();
-				using (WebSocketServer httpServer = new WebSocketServer(_listenerThreads, _connectionTimeoutMS, _idleSeconds, _url, HttpRequestHandler, _connectionManager, _logger))
+				try
 				{
-					try
-					{
-						httpServer.StartListening();  // start listening AFTER we have registered the handlers
-
-						// Since the main program passed in the cancellation token, it literally controls the completion of this task,
-						// which only happens when told to shut down with ^C or SIGINT.
-						await _cancellationTokenSrc.Token;  // magic!
-					}
-					catch (OperationCanceledException)
-					{
-						_logger(ELogVerboseType.Error, "Canceling WebServer.");
-					}
-					catch (Exception e)
-					{
-						if (e is HttpListenerException)
-						{
-							_logger(ELogVerboseType.Error, "If you get an Access Denied error, open an ADMIN command shell and run:");
-							_logger(ELogVerboseType.Error, $"   netsh http add urlacl url={_url} user=\"{Environment.UserDomainName}\\{Environment.UserName}\"");
-						}
-						else
-						{
-							_logger(ELogVerboseType.Error, $"Exception: {e}");
-						}
-					}
-					finally
-					{
-						await httpServer.StopListening().ConfigureAwait(false);  // kill all the connections and abort any that don't die quietly
-						_logger(ELogVerboseType.Warning, "WebServer has shutdown");
-					}
+					_httpServer.StartListening();  // start listening AFTER we have registered the handlers
 				}
+				catch (Exception e)
+				{
+					if (e is HttpListenerException)
+					{
+						_logger.Log(EVerbosity.Error, "If you get an Access Denied error, open an ADMIN command shell and run:");
+						_logger.Log(EVerbosity.Error, $"   netsh http add urlacl url={_url} user=\"{Environment.UserDomainName}\\{Environment.UserName}\"");
+					}
+					else
+					{
+						_logger.Log(EVerbosity.Error, $"Exception: {e}");
+					}
+					throw;
+				}
+				_logger.Log(EVerbosity.Warning, $"WebServer.Start listening at {_url}");
 			}
 
-			public void Shutdown()
+			public async Task Shutdown()
 			{
-				if (_cancellationTokenSrc!=null)
-				{
-					_cancellationTokenSrc.Cancel();
-					_cancellationTokenSrc.Dispose();
-					_cancellationTokenSrc = null;
-				}
-				_logger(ELogVerboseType.Error, "WebServer shutdown requested");
+				await _httpServer.StopListening().ConfigureAwait(false);  // kill all the connections and abort any that don't die quietly
+				_logger.Log(EVerbosity.Error, $"WebServer.Shutdown at {_url}");
 			}
 
 			//-------------------
@@ -98,34 +73,92 @@ namespace ReachableGames
 			//-------------------
 			// This is the set of http endpoint handlers are kept.  "/metrics" -> Metrics.HandleMetricsRequest, for example.
 			public delegate Task<(int, string, byte[])> HTTPRequestHandler(HttpListenerContext context);  // handlers should return (httpStatus, contentType, content) so we can handle errors gracefully
-			private Dictionary<string, HTTPRequestHandler> _endpointHandlers = new Dictionary<string, HTTPRequestHandler>();
+			
+			// Exact match endpoints - use dictionary for fast O(1) lookup
+			private Dictionary<string, HTTPRequestHandler> _exactEndpointHandlers = new Dictionary<string, HTTPRequestHandler>();
+			
+			// Prefix match endpoints - use list for ordered checking, stored as (prefix, handler) tuples
+			private List<(string prefix, HTTPRequestHandler handler)> _prefixEndpointHandlers = new List<(string, HTTPRequestHandler)>();
 
-			public void RegisterEndpoint(string urlPath, HTTPRequestHandler handler)
+			// Register an endpoint that matches exactly
+			public void RegisterExactEndpoint(string urlPath, HTTPRequestHandler handler)
 			{
-				if (_endpointHandlers.TryAdd(urlPath, handler) == false)
+				if (_exactEndpointHandlers.TryAdd(urlPath, handler) == false)
 				{
-					_logger(ELogVerboseType.Error, $"RegisterEndpoint {urlPath} is already defined.  Ignoring.");
+					_logger.Log(EVerbosity.Error, $"RegisterExactEndpoint {urlPath} is already defined.  Ignoring.");
 				}
 			}
 
-			public void UnregisterEndpoint(string urlPath)
+			// Register an endpoint that matches if the request path starts with the given prefix
+			public void RegisterPrefixEndpoint(string urlPrefix, HTTPRequestHandler handler)
 			{
-				if (_endpointHandlers.Remove(urlPath) == false)
+				// Check if this prefix is already registered
+				for (int i = 0; i < _prefixEndpointHandlers.Count; i++)
 				{
-					_logger(ELogVerboseType.Error, $"UnregisterEndpoint {urlPath} not found to unregister.");
+					if (_prefixEndpointHandlers[i].prefix == urlPrefix)
+					{
+						_logger.Log(EVerbosity.Error, $"RegisterPrefixEndpoint {urlPrefix} is already defined.  Ignoring.");
+						return;
+					}
 				}
+				
+				_prefixEndpointHandlers.Add((urlPrefix, handler));
+			}
+
+			// Unregister an exact endpoint
+			public void UnregisterExactEndpoint(string urlPath)
+			{
+				if (_exactEndpointHandlers.Remove(urlPath) == false)
+				{
+					_logger.Log(EVerbosity.Error, $"UnregisterExactEndpoint {urlPath} not found to unregister.");
+				}
+			}
+
+			// Unregister a prefix endpoint
+			public void UnregisterPrefixEndpoint(string urlPrefix)
+			{
+				for (int i = 0; i < _prefixEndpointHandlers.Count; i++)
+				{
+					if (_prefixEndpointHandlers[i].prefix == urlPrefix)
+					{
+						_prefixEndpointHandlers.RemoveAt(i);
+						return;
+					}
+				}
+				_logger.Log(EVerbosity.Error, $"UnregisterPrefixEndpoint {urlPrefix} not found to unregister.");
 			}
 
 			// Regular HTTP calls come here.  They are dispatched to any registered endpoints.
 			private async Task HttpRequestHandler(HttpListenerContext httpContext)
 			{
-				int    responseCode = 500;
-				string responseContentType = "text/plain";
-				byte[] responseContent = null;
+				int     responseCode = 500;
+				string  responseContentType = "text/plain";
+				byte[]? responseContent = null;
 
 				string path = httpContext.Request.Url?.AbsolutePath ?? string.Empty;
 				string relativeEndpoint = string.IsNullOrEmpty(_urlPath) ? path : path.Replace(_urlPath, string.Empty);
-				if (_endpointHandlers.TryGetValue(relativeEndpoint, out HTTPRequestHandler handler))
+				
+				HTTPRequestHandler? handler = null;
+				
+				// First, try exact match (fastest - O(1) dictionary lookup)
+				if (_exactEndpointHandlers.TryGetValue(relativeEndpoint, out handler))
+				{
+					// Found exact match
+				}
+				else
+				{
+					// If no exact match, check prefix matches (slower - O(n) list iteration)
+					foreach (var (prefix, prefixHandler) in _prefixEndpointHandlers)
+					{
+						if (relativeEndpoint.StartsWith(prefix))
+						{
+							handler = prefixHandler;
+							break; // Use the first matching prefix
+						}
+					}
+				}
+				
+				if (handler != null)
 				{
 					try
 					{
@@ -157,7 +190,7 @@ namespace ReachableGames
 				}
 				catch (Exception e)
 				{
-					_logger(ELogVerboseType.Error, $"Exception while trying to write to http response.  {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
+					_logger.Log(EVerbosity.Error, $"Exception while trying to write to http response.  {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
 				}
 			}
 		}

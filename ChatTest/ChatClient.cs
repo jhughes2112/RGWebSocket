@@ -1,4 +1,4 @@
-//-------------------
+﻿//-------------------
 // Reachable Games
 // Copyright 2026
 //-------------------
@@ -9,6 +9,7 @@
 // or closes and reconnects for another session.
 
 using System;
+using Logging;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -27,7 +28,7 @@ namespace ReachableGames
 				private readonly string        _shortId;
 				private readonly string        _url;
 				private readonly Random        _rng;
-				private readonly OnLogDelegate _logger;
+				private readonly ILogging _logger;
 				private readonly int           _startDelayMs;
 				private readonly int           _playMs;
 
@@ -43,7 +44,7 @@ namespace ReachableGames
 				public long   BinaryBytesReceived;
 				public string FatalError = null;
 
-				public ChatClient(string url, Random rng, OnLogDelegate logger, int startDelayMs, int playMs)
+				public ChatClient(string url, Random rng, ILogging logger, int startDelayMs, int playMs)
 				{
 					_url = url;
 					_rng = rng;
@@ -74,7 +75,7 @@ namespace ReachableGames
 					catch (Exception e)
 					{
 						FatalError = e.ToString();
-						_logger(ELogVerboseType.Error, $"[client {_shortId}] FATAL {e}");
+						_logger.Log(EVerbosity.Error, $"[client {_shortId}] FATAL {e}");
 					}
 					finally
 					{
@@ -104,7 +105,7 @@ namespace ReachableGames
 					if (_uws.IsConnected==false)
 					{
 						ConnectFailures++;
-						_logger(ELogVerboseType.Warning, $"[client {_shortId}] connect failed: {_uws.LastError}");
+						_logger.Log(EVerbosity.Warning, $"[client {_shortId}] connect failed: {_uws.LastError}");
 						return false;
 					}
 
@@ -136,7 +137,7 @@ namespace ReachableGames
 						if (_uws.IsDisconnected==false)
 						{
 							CloseTimeouts++;
-							_logger(ELogVerboseType.Warning, $"[client {_shortId}] graceful close did not complete within 3s, aborting");
+							_logger.Log(EVerbosity.Warning, $"[client {_shortId}] graceful close did not complete within 3s, aborting");
 						}
 					}
 					else if (_uws.IsConnected)
@@ -191,25 +192,25 @@ namespace ReachableGames
 					return _peers[_rng.Next(_peers.Count)];
 				}
 
-				// Pull everything out of the socket's incoming queue and process it.  Binary messages are refcounted and MUST be disposed.
+				// Pull everything out of the socket's incoming queue and process it.  ALL messages are refcounted and MUST be disposed.
 				private void Drain(List<UnityWebSocket.wsMessage> inbox)
 				{
 					_uws.ReceiveAll(inbox);  // appends; we clear below
 					for (int i=0; i<inbox.Count; i++)
 					{
-						if (inbox[i].binMsg!=null)
+						using (PooledArray pa = inbox[i].msg)  // we own this reference now, release it when done
 						{
-							using (PooledArray pa = inbox[i].binMsg)  // we own this reference now, release it when done
+							if (inbox[i].isText)
+							{
+								HandleText(inbox[i].Text);
+							}
+							else
 							{
 								BinariesReceived++;
 								BinaryBytesReceived += pa.Length;
 								if (pa.Length<1 || pa.data[0]!=kBinaryMagic)
 									BinaryCorrupt++;
 							}
-						}
-						else
-						{
-							HandleText(inbox[i].stringMsg);
 						}
 					}
 					inbox.Clear();
@@ -246,7 +247,7 @@ namespace ReachableGames
 					else
 					{
 						UnknownMsgs++;
-						_logger(ELogVerboseType.Warning, $"[client {_shortId}] unknown message: {msg}");
+						_logger.Log(EVerbosity.Warning, $"[client {_shortId}] unknown message: {msg}");
 					}
 				}
 			}
