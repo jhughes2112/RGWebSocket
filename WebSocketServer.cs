@@ -140,24 +140,26 @@ namespace ReachableGames
 				await ReapAll().ConfigureAwait(false);  // final sweep, in case anything was queued while we were being told to exit
 			}
 
+			private List<RGWebSocket> _reapWorking = new List<RGWebSocket>();  // only ever touched by the single reaper task
 			private async Task ReapAll()
 			{
-				RGWebSocket? rgws;
-				while ((rgws = _reapQueue.PopFront())!=null)
+				_reapQueue.MoveTo(_reapWorking);  // bulk-drain under one lock, same pattern as the send queue
+				for (int i=0; i<_reapWorking.Count; i++)
 				{
 					try
 					{
-						await rgws.Shutdown().ConfigureAwait(false);
+						await _reapWorking[i].Shutdown().ConfigureAwait(false);
 					}
 					catch (Exception e)
 					{
-						_logger.Log(EVerbosity.Error, $"WebSocketServer.ReapAll {rgws._displayId} {e}");
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.ReapAll {_reapWorking[i]._displayId} {e}");
 					}
 					finally
 					{
 						Interlocked.Decrement(ref _pendingReaps);
 					}
 				}
+				_reapWorking.Clear();
 			}
 
 			//-------------------

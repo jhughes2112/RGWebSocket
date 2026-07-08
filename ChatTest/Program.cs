@@ -13,6 +13,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
 using Logging;
@@ -130,10 +131,69 @@ namespace ReachableGames
 						Console.WriteLine($"HTTP GET /status -> \"{await http.GetStringAsync($"http://localhost:{port}/status").ConfigureAwait(false)}\"");
 
 					//-------------------
-					// Phase 2: shut the server down WHILE clients are still connected and chatting.  This exercises
+					// Phase 2: slow-consumer circuit breaker.  A "zombie" client connects, identifies, then never reads another byte,
+					// so its TCP window fills and the server's sends to it stall.  A flooder then broadcasts big binary blobs (relayed
+					// to the zombie) until the zombie's server-side unsent queue blows past the library's limit and the server
+					// disconnects it.  The leak check at the end proves the multi-megabyte abandoned queue was fully released.
+					Console.WriteLine();
+					Console.WriteLine("Phase 2: zombie client (never reads) + flooder; server should disconnect the zombie at the unsent-bytes limit...");
+					bool zombieDiscoed = false;
+					long zombieDiscoMs = 0;
+					int membersAtFloodStart = 0;
+					using (ClientWebSocket zombie = new ClientWebSocket())
+					{
+						await zombie.ConnectAsync(new Uri($"ws://localhost:{port}/"), CancellationToken.None).ConfigureAwait(false);
+						byte[] iam = System.Text.Encoding.UTF8.GetBytes($"iam {Guid.NewGuid()}");
+						await zombie.SendAsync(new ArraySegment<byte>(iam), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
+						// ...and now the zombie never calls ReceiveAsync again.
+
+						UnityWebSocket flooder = new UnityWebSocket(logger, "[flooder]", null, 5000);
+						await flooder.Connect($"ws://localhost:{port}/", new Dictionary<string, string>()).ConfigureAwait(false);
+						flooder.Send($"iam {Guid.NewGuid()}");
+						await Task.Delay(250).ConfigureAwait(false);  // let both register as members
+						membersAtFloodStart = mgr.CurrentCount;       // should be 2
+
+						long floodStart = Environment.TickCount64;
+						List<UnityWebSocket.wsMessage> floodInbox = new List<UnityWebSocket.wsMessage>();
+						for (int i=0; i<100 && mgr.CurrentCount>1; i++)  // up to 100 x 512KB = 50MB before we give up
+						{
+							using (PooledArray blob = PooledArray.BorrowFromPool(512*1024))
+							{
+								blob.data[0] = 0xAB;  // keep the magic byte so nothing counts as corrupt
+								flooder.Send(blob);
+							}
+							flooder.ReceiveAll(floodInbox);  // drain our own relayed copies so the FLOODER doesn't back up
+							foreach (UnityWebSocket.wsMessage m in floodInbox)
+								using (m.msg) { }
+							floodInbox.Clear();
+							await Task.Delay(25).ConfigureAwait(false);
+						}
+						long discoDeadline = Environment.TickCount64 + 10000;
+						while (mgr.CurrentCount>1 && Environment.TickCount64<discoDeadline)
+							await Task.Delay(50).ConfigureAwait(false);
+						zombieDiscoed = (mgr.CurrentCount<=1);
+						zombieDiscoMs = Environment.TickCount64 - floodStart;
+						Console.WriteLine($"Phase 2: members at flood start={membersAtFloodStart}; zombie {(zombieDiscoed ? $"disconnected by server in {zombieDiscoMs}ms" : "NOT disconnected -- circuit breaker never tripped")}");
+
+						flooder.Close();
+						await Task.Delay(250).ConfigureAwait(false);
+						flooder.Shutdown();
+						flooder.ReceiveAll(floodInbox);  // release any relayed blobs that arrived during teardown
+						foreach (UnityWebSocket.wsMessage m in floodInbox)
+							using (m.msg) { }
+						floodInbox.Clear();
+					}
+					{
+						long p2deadline = Environment.TickCount64 + 5000;  // wait for the server to finish reaping both phase 2 sockets
+						while (mgr.CurrentCount>0 && Environment.TickCount64<p2deadline)
+							await Task.Delay(50).ConfigureAwait(false);
+					}
+
+					//-------------------
+					// Phase 3: shut the server down WHILE clients are still connected and chatting.  This exercises
 					// ConnectionManager.Shutdown -> server-initiated close handshakes -> reaper drain, under load.
 					Console.WriteLine();
-					Console.WriteLine("Phase 2: spawning lingering clients, then shutting the server down underneath them...");
+					Console.WriteLine("Phase 3: spawning lingering clients, then shutting the server down underneath them...");
 					List<ChatClient> lingerers = new List<ChatClient>();
 					List<Task> lingerTasks = new List<Task>();
 					for (int i=0; i<8; i++)
@@ -150,7 +210,7 @@ namespace ReachableGames
 					Task allLingerers = Task.WhenAll(lingerTasks);
 					bool lingerersHung = (await Task.WhenAny(allLingerers, Task.Delay(15000)).ConfigureAwait(false)) != allLingerers;
 					int afterShutdownCount = mgr.CurrentCount;
-					Console.WriteLine($"Phase 2: server shutdown took {shutdownMs}ms with {connectedBeforeShutdown} clients connected; clients {(lingerersHung ? "HUNG" : "all exited")}; server tracks {afterShutdownCount}.");
+					Console.WriteLine($"Phase 3: server shutdown took {shutdownMs}ms with {connectedBeforeShutdown} clients connected; clients {(lingerersHung ? "HUNG" : "all exited")}; server tracks {afterShutdownCount}.");
 					clientList.AddRange(lingerers);  // fold their stats into the aggregate below
 
 					await Task.Delay(250).ConfigureAwait(false);
@@ -217,10 +277,12 @@ namespace ReachableGames
 					if (liveAllocs>1)                           failures.Add($"PooledArray leak: {liveAllocs} live buffers (expected 1)");
 					if (welcomes!=sessions)                     failures.Add($"welcomes ({welcomes}) != sessions ({sessions}) -- lost or duplicated handshakes");
 					if (closeTimeouts>0)                        failures.Add($"{closeTimeouts} graceful closes timed out");
-					if (connectedBeforeShutdown<8)              failures.Add($"phase 2 only had {connectedBeforeShutdown} clients connected at server shutdown (expected 8)");
-					if (lingerersHung)                          failures.Add("phase 2 clients did not exit within 15s of server shutdown");
-					if (afterShutdownCount>0)                   failures.Add($"phase 2: server still tracked {afterShutdownCount} connections after shutdown");
-					if (shutdownMs>10000)                       failures.Add($"phase 2: server shutdown took {shutdownMs}ms (expected well under 10s)");
+					if (membersAtFloodStart!=2)                 failures.Add($"phase 2: expected zombie+flooder (2 members) at flood start, had {membersAtFloodStart}");
+					if (zombieDiscoed==false)                   failures.Add("phase 2: slow consumer was never disconnected -- the unsent-bytes circuit breaker did not trip");
+					if (connectedBeforeShutdown<8)              failures.Add($"phase 3 only had {connectedBeforeShutdown} clients connected at server shutdown (expected 8)");
+					if (lingerersHung)                          failures.Add("phase 3 clients did not exit within 15s of server shutdown");
+					if (afterShutdownCount>0)                   failures.Add($"phase 3: server still tracked {afterShutdownCount} connections after shutdown");
+					if (shutdownMs>10000)                       failures.Add($"phase 3: server shutdown took {shutdownMs}ms (expected well under 10s)");
 
 					if (failures.Count==0)
 					{

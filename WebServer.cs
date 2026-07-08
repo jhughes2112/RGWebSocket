@@ -18,8 +18,7 @@ namespace ReachableGames
 		public class WebServer
 		{
 			private readonly string              _url;
-			private readonly string              _urlPath;        // if this server is hosted at http://some.com/foo/bar then this variable will contain foo/bar for easy removal
-			private readonly string              _urlPathPrefix;  // "/foo/bar/" form of the above, for prefix-stripping request paths
+			private readonly string              _urlPathPrefix;  // if this server is hosted at http://some.com/foo/bar, this is "/foo/bar/", for prefix-stripping request paths
 			private readonly ILogging            _logger;
 			private WebSocketServer              _httpServer;
 
@@ -31,8 +30,8 @@ namespace ReachableGames
 				_logger              = logger;
 
 				string[] urlParts = url.Split('/');  // When you have a url, you have protocol://domain:port/path/part/etc
-				_urlPath          = string.Join('/', urlParts, 3, urlParts.Length-3);  // this leaves you with path/part/etc
-				_urlPathPrefix    = "/" + _urlPath;
+				string urlPath    = string.Join('/', urlParts, 3, urlParts.Length-3);  // this leaves you with path/part/etc
+				_urlPathPrefix    = "/" + urlPath;
 				if (_urlPathPrefix.EndsWith("/", StringComparison.Ordinal)==false)
 					_urlPathPrefix += "/";
 

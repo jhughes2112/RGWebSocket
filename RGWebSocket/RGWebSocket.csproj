@@ -26,7 +26,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="..\CancellationTokenAwaiter.cs" Link="CancellationTokenAwaiter.cs" />
     <Compile Include="..\IConnectionManager.cs" Link="IConnectionManager.cs" />
     <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
     <Compile Include="..\LockingList.cs" Link="LockingList.cs" />

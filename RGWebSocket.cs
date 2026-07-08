@@ -33,8 +33,9 @@ namespace ReachableGames
 			private Func<RGWebSocket, Task>                    _onDisconnectionCb;      // this must run straight through and NOT touch any tracking structures the RGWS might be added to.  This maybe called DURING the constructor!
 			private ILogging                             _logger;
 
-			private const int kRecvBufferSize     = 4096;       // buffer size for receiving chunks of messages
-			private const int kReallyBigMessage   = 1024*1024;  // we can handle messages bigger than this, but every time we have one bigger than this, we reset our internal receive array to free memory
+			private const int kRecvBufferSize     = 4096;         // buffer size for receiving chunks of messages
+			private const int kReallyBigMessage   = 1024*1024;    // we can handle messages bigger than this, but every time we have one bigger than this, we reset our internal receive array to free memory
+			private const int kMaxUnsentBytes     = 4*1024*1024;  // circuit breaker: a connection whose unsent queue exceeds this is too slow to keep up (dead client, saturated pipe, etc), so we disconnect it rather than hoard memory on its behalf.  This is intentionally a low-level, message-agnostic policy -- deciding which messages are discardable is an application-level concern that does not belong here.
 
 			private AsyncAutoResetEvent      _releaseSendThread = new AsyncAutoResetEvent(false);  // this makes it easy to release the send thread when a new message is available
 			private CancellationTokenSource? _cancellationTokenSource = new CancellationTokenSource();
@@ -173,7 +174,13 @@ namespace ReachableGames
 					// There's a race condition where the socket is torn down but a message gets added to the queue and a refcount leaks, so we have to avoid queueing it up if the socket is canceled already
 					if (_cancellationTokenSource!=null && _cancellationTokenSource.IsCancellationRequested==false)
 					{
-						Interlocked.Add(ref _unsentBytes, binMsg.Length);
+						int unsentBytes = Interlocked.Add(ref _unsentBytes, binMsg.Length);
+						if (unsentBytes>kMaxUnsentBytes)  // slow consumer circuit breaker -- see kMaxUnsentBytes
+						{
+							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {kMaxUnsentBytes}).  Disconnecting slow consumer.");
+							_cancellationTokenSource.Cancel();  // tears down both pumps; already-queued messages are drained and released by the send task's finally
+							return;  // this message is NOT queued (no IncRef happened) -- the connection is already dying
+						}
 						binMsg.IncRef();      // because this is being queued, we don't want to let the caller reap the buffer yet
 						QueuedSendMsg qsm = new QueuedSendMsg() { binMsg = binMsg, isText = false, enqueuedTick = DateTime.UtcNow.Ticks };
 						_outgoing.Add(qsm);        // this automatically locks the queue on add/remove
@@ -196,9 +203,15 @@ namespace ReachableGames
 					if (_cancellationTokenSource!=null && _cancellationTokenSource.IsCancellationRequested==false)
 					{
 						int byteCount = System.Text.Encoding.UTF8.GetByteCount(msg);
+						int unsentBytes = Interlocked.Add(ref _unsentBytes, byteCount);
+						if (unsentBytes>kMaxUnsentBytes)  // slow consumer circuit breaker -- see kMaxUnsentBytes
+						{
+							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {kMaxUnsentBytes}).  Disconnecting slow consumer.");
+							_cancellationTokenSource.Cancel();  // tears down both pumps; already-queued messages are drained and released by the send task's finally
+							return;  // this message is NOT queued (nothing was borrowed) -- the connection is already dying
+						}
 						PooledArray textMsg = PooledArray.BorrowFromPool(byteCount);  // the queue takes over this initial reference, no IncRef needed
 						System.Text.Encoding.UTF8.GetBytes(msg, 0, msg.Length, textMsg.data, 0);
-						Interlocked.Add(ref _unsentBytes, byteCount);
 						QueuedSendMsg qsm = new QueuedSendMsg() { binMsg = textMsg, isText = true, enqueuedTick = DateTime.UtcNow.Ticks };
 						_outgoing.Add(qsm);        // this automatically locks the queue on add/remove
 						_releaseSendThread.Set();  // unlock the send thread since there's work for it to do
