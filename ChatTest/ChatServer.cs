@@ -1,4 +1,4 @@
-﻿//-------------------
+//-------------------
 // Reachable Games
 // Copyright 2026
 //-------------------
@@ -47,7 +47,7 @@ namespace ReachableGames
 				{
 					_sockets.TryAdd(rgws, Guid.Empty);
 					Interlocked.Increment(ref _connections);
-					_logger.Log(EVerbosity.Debug, $"ChatServer: connection {rgws._displayId} (now {_sockets.Count})");
+					_logger.Log(EVerbosity.Debug, $"ChatServer: connection {rgws.DisplayId} (now {_sockets.Count})");
 					return Task.CompletedTask;
 				}
 
@@ -56,7 +56,7 @@ namespace ReachableGames
 					if (_sockets.TryRemove(rgws, out Guid id) && id!=Guid.Empty)
 						_members.TryRemove(id, out _);
 					Interlocked.Increment(ref _disconnections);
-					_logger.Log(EVerbosity.Debug, $"ChatServer: disconnect {rgws._displayId} (now {_sockets.Count})");
+					_logger.Log(EVerbosity.Debug, $"ChatServer: disconnect {rgws.DisplayId} (now {_sockets.Count})");
 					return Task.CompletedTask;
 				}
 

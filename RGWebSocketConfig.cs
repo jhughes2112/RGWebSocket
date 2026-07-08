@@ -20,10 +20,6 @@ namespace ReachableGames
 			// Buffer size for receiving chunks of messages off the wire.
 			public int ReceiveBufferBytes { get; set; } = 4096;
 
-			// Whenever a single received message exceeds this, the internal receive accumulator is shrunk back to ReceiveBufferBytes
-			// afterward, so one huge (but legal) message doesn't pin memory for the connection's lifetime.
-			public int LargeMessageResetBytes { get; set; } = 1024*1024;
-
 			// Inbound circuit breaker: a connection that sends a single message bigger than this is disconnected mid-accumulation.
 			// Without this, a hostile client can OOM the server with one endless fragmented message.
 			public int MaxInboundMessageBytes { get; set; } = 16*1024*1024;

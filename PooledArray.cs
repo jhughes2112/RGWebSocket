@@ -44,7 +44,7 @@ namespace ReachableGames
 				// Check the RESULT of the decrement -- pre-checking refCount is a race, and a double-Dispose could slip from 1 -> 0 -> -1 silently.
 				int newCount = Interlocked.Decrement(ref refCount);
 				if (newCount<0)
-					throw new Exception("Logic error: Reference count went negative in PooledArray.  Probably a double-Dispose.");
+					throw new InvalidOperationException("Logic error: Reference count went negative in PooledArray.  Probably a double-Dispose.");
 				if (newCount==0)
 				{
 #if DEBUG
@@ -147,7 +147,7 @@ namespace ReachableGames
 				// which would put this buffer back in the pool twice and hand the same array to two different owners.
 				int newCount = Interlocked.Decrement(ref refCount);
 				if (newCount<0 || _data==null)
-					throw new Exception("Logic error: Reference count went negative in PooledArray.  Probably a double-Dispose.");
+					throw new InvalidOperationException("Logic error: Reference count went negative in PooledArray.  Probably a double-Dispose.");
 
 				if (newCount==0)
 				{

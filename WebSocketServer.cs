@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Net.WebSockets;
 using System.Diagnostics;
+using DataCollection;
 using Logging;
 using Nito.AsyncEx;
 using Shared;
@@ -35,6 +36,9 @@ namespace ReachableGames
 			private IConnectionManager        _connectionManager;
 			private RGWebSocketConfig         _config;
 
+			// Distribution-oriented server metrics, fed automatically.  Read live any time, e.g. from a /metrics endpoint handler.
+			public WebSocketServerMetrics     Metrics { get; } = new WebSocketServerMetrics();
+
 			private Task                      _listenerUpdateTask = Task.CompletedTask;  // sleeps until one of the listeners finishes its work, then it creates a new one.  When _isRunning goes false, this exits.
 			private HttpListener              _listener = new HttpListener();  // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Close() on this, the listener stops but websockets do not abort.
 
@@ -54,14 +58,18 @@ namespace ReachableGames
 			private List<RGWebSocket>         _sweepWorking = new List<RGWebSocket>();  // only ever touched by the single sweep task
 
 			// httpRequest callback allows you to handle ordinary non-websocket HTTP requests however you want, even at the same url
-			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config)
+			// dataCollection is nullable ON PURPOSE (not a default parameter): pass your IDataCollection derivative to have
+			// connection/disconnect/message metrics pushed into it for prometheus scraping, or pass null explicitly if you don't.
+			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config, IDataCollection? dataCollection)
 			{
 				if (logger==null)
-					throw new Exception("Logger may not be null.");
-				if (connectionManager == null)
-					throw new Exception("ConnectionManager may not be null.");
+					throw new ArgumentNullException(nameof(logger));
+				if (connectionManager==null)
+					throw new ArgumentNullException(nameof(connectionManager));
 				if (config==null)
-					throw new Exception("Config may not be null.  Pass RGWebSocketConfig.Default if you want the defaults.");
+					throw new ArgumentNullException(nameof(config), "Pass RGWebSocketConfig.Default if you want the defaults.");
+				if (dataCollection!=null)
+					Metrics.AttachDataCollection(dataCollection);
 				_listenerTasks       = listenerTasks;
 				_connectionMS        = connectionMS;
 				_prefixURL           = prefixURL;
@@ -83,7 +91,7 @@ namespace ReachableGames
 			public void StartListening()
 			{
 				if (IsListening())
-					throw new Exception("WebSocketServer.StartListening should not be called twice without StopListening");
+					throw new InvalidOperationException("WebSocketServer.StartListening should not be called twice without StopListening");
 
 				// Kick off the listener update task.  It makes sure there are always _maxCount listener threads available to accept incoming connections.
 				try
@@ -175,11 +183,11 @@ namespace ReachableGames
 					// All the unit conversion happens HERE, once per sweep pass -- the per-frame stamp in RGWebSocket is just a raw clock read.
 					long idleTimestampTicks = _config.IdleDisconnectSeconds * Stopwatch.Frequency;
 					long now = Stopwatch.GetTimestamp();  // monotonic, immune to the NTP clock corrections that are common in containers/VMs
-					_liveSockets.Foreach((rgws, unused) => { if (now - rgws._lastRecvTimestamp > idleTimestampTicks) _sweepWorking.Add(rgws); });  // collect under the read lock, act outside it
+					_liveSockets.Foreach((rgws, unused) => { if (now - rgws.LastRecvTimestamp > idleTimestampTicks) _sweepWorking.Add(rgws); });  // collect under the read lock, act outside it
 					for (int i=0; i<_sweepWorking.Count; i++)
 					{
-						_logger.Log(EVerbosity.Warning, $"WebSocketServer.IdleSweep disconnecting {_sweepWorking[i]._displayId} (nothing received for over {_config.IdleDisconnectSeconds}s)");
-						_sweepWorking[i].Close();
+						_logger.Log(EVerbosity.Warning, $"WebSocketServer.IdleSweep disconnecting {_sweepWorking[i].DisplayId} (nothing received for over {_config.IdleDisconnectSeconds}s)");
+						_sweepWorking[i].Close(EDisconnectReason.IdleTimeout);  // tagged so the disconnect metrics tell the true story
 					}
 					_sweepWorking.Clear();
 				}
@@ -197,7 +205,7 @@ namespace ReachableGames
 					}
 					catch (Exception e)
 					{
-						_logger.Log(EVerbosity.Error, $"WebSocketServer.ReapAll {_reapWorking[i]._displayId} {e}");
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.ReapAll {_reapWorking[i].DisplayId} {e}");
 					}
 					finally
 					{
@@ -320,17 +328,22 @@ namespace ReachableGames
 							// the connection manager gets to register the socket FIRST, and only then does Start() spin up the pumps, so no
 							// callback can ever race the registration.
 							RGWebSocket rgws = new RGWebSocket(httpContext, OnReceive, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, _config);
+							bool recordedConnect = false;
 							try
 							{
 								await _connectionManager.OnConnection(rgws, httpContext).ConfigureAwait(false);
 								_liveSockets.Add(rgws, rgws);  // tracked for the idle sweep; removed in OnDisconnection
+								Metrics.RecordConnect();
+								recordedConnect = true;
 								rgws.Start();
-								_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - websocket detected.  Upgrade completed. {rgws._displayId}");
+								_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - websocket detected.  Upgrade completed. {rgws.DisplayId}");
 							}
 							catch
 							{
 								_liveSockets.Remove(rgws);
 								await rgws.Shutdown().ConfigureAwait(false);  // the manager rejected it (threw), so dispose the never-started socket cleanly
+								if (recordedConnect)
+									Metrics.RecordDisconnect(rgws);  // keep connect/disconnect counts balanced
 								throw;
 							}
 						}
@@ -389,6 +402,7 @@ namespace ReachableGames
 			// The core delivers text messages as UTF8 bytes in a pooled buffer; decode here at the edge, since IConnectionManager wants strings for text.
 			private Task OnReceive(RGWebSocket rgws, PooledArray msg, bool isText)
 			{
+				Metrics.RecordInboundMessage(msg.Length);
 				if (isText)
 					return _connectionManager.OnReceiveText(rgws, System.Text.Encoding.UTF8.GetString(msg.data, 0, msg.Length));
 				return _connectionManager.OnReceiveBinary(rgws, msg);
@@ -397,21 +411,22 @@ namespace ReachableGames
 			// Add this websocket to the list of those we need to remove and unblock the cleanup thread
 			private async Task OnDisconnection(RGWebSocket rgws)
 			{
-				_logger.Log(EVerbosity.Debug, $"{rgws._displayId} OnDisconnection call.");
+				_logger.Log(EVerbosity.Debug, $"{rgws.DisplayId} OnDisconnection call.");
 				try
 				{
 					await _connectionManager.OnDisconnect(rgws).ConfigureAwait(false);  // let the connection manager know it's disconnected now
 				}
 				catch (Exception e)
 				{
-					_logger.Log(EVerbosity.Error, $"WebSocketServer.OnDisconnection Exception: {rgws._displayId} {e.Message}");
+					_logger.Log(EVerbosity.Error, $"WebSocketServer.OnDisconnection Exception: {rgws.DisplayId} {e.Message}");
 				}
 				finally
 				{
 					// Hand the socket to the reaper for final disposal.  We are running ON this socket's send task right now, so awaiting
 					// rgws.Shutdown() here would deadlock waiting for ourselves.  The reaper shuts it down from outside instead.
-					_logger.Log(EVerbosity.Debug, $"WebSocketServer.OnDisconnection queued for reaping {rgws._displayId}");
+					_logger.Log(EVerbosity.Debug, $"WebSocketServer.OnDisconnection queued for reaping {rgws.DisplayId}");
 					_liveSockets.Remove(rgws);  // no longer a candidate for the idle sweep
+					Metrics.RecordDisconnect(rgws);  // fold this socket's lifetime stats into the distributions, tagged by cause
 					Interlocked.Increment(ref _pendingReaps);
 					_reapQueue.Add(rgws);
 					_reaperWake.Set();

@@ -70,7 +70,7 @@ namespace Shared
 				{
 					value = callback();
 					if (value==null)
-						throw new Exception("ThreadSafeDictionary.GetOrAdd callback returned null; refusing to poison the dictionary.");  // fail fast here, not mysteriously at some later TryGetValue
+						throw new InvalidOperationException("ThreadSafeDictionary.GetOrAdd callback returned null; refusing to poison the dictionary.");  // fail fast here, not mysteriously at some later TryGetValue
 					_dictionary.Add(key, value);
 				}
 				return value;

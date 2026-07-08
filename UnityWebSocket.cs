@@ -57,15 +57,15 @@ namespace ReachableGames
 			public bool IsConnected => _status == Status.Connected;
 			public bool IsConnecting => _status == Status.Connecting;
 			public bool IsDisconnected => _status == Status.ReadyToConnect;
-			public string LastError { get { return _rgws?._lastError ?? _lastErrorMsg; } private set { _lastErrorMsg = value; } }
+			public string LastError { get { return _rgws?.LastError ?? _lastErrorMsg; } private set { _lastErrorMsg = value; } }
 			public void GetStats(out int sentMsgs, out long sentBytes, out int recvMsgs, out long recvBytes)
 			{
 				if (_rgws!=null)
 				{
-					sentMsgs = _rgws._stats_sentMsgs;
-					sentBytes = _rgws._stats_sentBytes;
-					recvMsgs = _rgws._stats_recvMsgs;
-					recvBytes = _rgws._stats_recvBytes;
+					sentMsgs = _rgws.SentMessages;
+					sentBytes = _rgws.SentBytes;
+					recvMsgs = _rgws.RecvMessages;
+					recvBytes = _rgws.RecvBytes;
 				}
 				else
 				{
@@ -81,7 +81,7 @@ namespace ReachableGames
 			public UnityWebSocket(ILogging logger, string loggerPrefix, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS, RGWebSocketConfig config)
 			{
 				if (config==null)
-					throw new Exception("Cannot pass null in for config.  Pass RGWebSocketConfig.Default if you want the defaults.");
+					throw new ArgumentNullException(nameof(config), "Pass RGWebSocketConfig.Default if you want the defaults.");
 				_logger = logger;
 				_loggerPrefix = loggerPrefix;
 				_disconnectCallback = disconnectCallback;
@@ -110,7 +110,7 @@ namespace ReachableGames
 			private async Task DoConnection()
 			{
 				if (_status!=Status.ReadyToConnect)
-					throw new Exception("Not in status=ReadyToConnect.");
+					throw new InvalidOperationException("UnityWebSocket cannot Connect/Reconnect unless status is ReadyToConnect.  Call Shutdown() first.");
 				if (_rgws!=null)
 					Shutdown();  // the previous connection ended remotely and was never explicitly Shutdown; dispose it so Connect/Reconnect doesn't leak it
 

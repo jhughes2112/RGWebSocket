@@ -1,4 +1,4 @@
-﻿#nullable enable
+#nullable enable
 //-------------------
 // Reachable Games
 // Copyright 2023
@@ -19,6 +19,21 @@ namespace ReachableGames
 {
 	namespace RGWebSocket
 	{
+		// Why a socket died.  Stamped exactly once (the FIRST cause wins) at the moment the connection's fate is decided,
+		// so ops can count disconnects by cause instead of parsing error strings.
+		public enum EDisconnectReason
+		{
+			None = 0,              // still alive (or never started)
+			RemoteClose,           // the peer initiated the close handshake
+			LocalClose,            // this side called Close() and the handshake ran
+			TransportError,        // network death: abort, reset, receive/send exception, connect that never finished
+			OutboundBackpressure,  // RGWebSocketConfig.MaxUnsentBytes circuit breaker -- peer too slow to keep up
+			InboundOversize,       // RGWebSocketConfig.MaxInboundMessageBytes circuit breaker -- peer sent an abusive message
+			IdleTimeout,           // WebSocketServer's idle sweep -- nothing received within RGWebSocketConfig.IdleDisconnectSeconds
+			UserCodeException,     // an application callback threw
+			LocalShutdown,         // Shutdown() was called while the socket was still healthy
+		}
+
 		// This handles all the async/await management, speaking the websocket protocol, and manages the connection for you.
 		// It's a little low-level to speak to directly, so check out ServerWebSocket and UnityWebSocket for writing applications.
 		// There is a send thread and a recv thread that hang around until the socket closes.  The onDisconnect callback is called
@@ -45,24 +60,34 @@ namespace ReachableGames
 			private TaskCompletionSource<bool> _shutdownDone = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 			
 			// Basic metrics
-			public string _displayId           { get; private set; }  // good for troubleshooting
-			public long   _connectedAtTicks    { get; private set; }
+			public string DisplayId           { get; private set; }  // good for troubleshooting
+			public long   ConnectedAtTicks    { get; private set; }
 			private int   _unsentBytes;                              // this is how you can tell if the socket is backed up
-			public int    _stats_unsentBytes  => _unsentBytes;       // accessor
-			public int    _stats_sentMsgs      { get; private set; }
-			public long   _stats_sentBytes     { get; private set; }
-			public int    _stats_recvMsgs      { get; private set; }
-			public long   _stats_recvBytes     { get; private set; }
-			public long   _stats_msgQueuedTime { get; private set; }
-			public int    _websocketState      { get { return (int)_webSocket!.State; } }
-			public long   _lastRecvTimestamp   { get; private set; }  // RAW Stopwatch.GetTimestamp() ticks, stamped every time ANY data arrives -- the cheapest possible liveness stamp (one clock read, one store, no unit conversion).  Compare against Stopwatch.GetTimestamp() and scale by Stopwatch.Frequency; the idle sweep does its one divide per pass, not per stamp.  Receiving is the only proof of liveness (sends just fill kernel buffers).  Deliberately not wall-clock: NTP corrections (common in containers/VMs) would make idle math jump around.
-			public string _lastError           { get { return _actualLastErr; } private set { _actualLastErr = value; } }
-			public bool   IsReadyForReaping    { get; private set; } = false;  // this is set true just before the OnDisconnect callback happens, because of the threaded nature of networking, it's useful to know it's already closed
+			public int    UnsentBytes  => _unsentBytes;       // accessor
+			public int    SentMessages      { get; private set; }
+			public long   SentBytes     { get; private set; }
+			public int    RecvMessages      { get; private set; }
+			public long   RecvBytes     { get; private set; }
+			public long   QueuedTimeMS { get; private set; }
+			public WebSocketState State        => _webSocket!.State;  // safe to read even after Shutdown
+			public long   LastRecvTimestamp   { get; private set; }  // RAW Stopwatch.GetTimestamp() ticks, stamped every time ANY data arrives -- the cheapest possible liveness stamp (one clock read, one store, no unit conversion).  Compare against Stopwatch.GetTimestamp() and scale by Stopwatch.Frequency; the idle sweep does its one divide per pass, not per stamp.  Receiving is the only proof of liveness (sends just fill kernel buffers).  Deliberately not wall-clock: NTP corrections (common in containers/VMs) would make idle math jump around.
+			public string LastError           { get { return _actualLastErr; } private set { _actualLastErr = value; } }
+
+			// Why this socket died.  None while healthy; the first cause observed wins and later causes are ignored, so races
+			// (e.g. Close() colliding with a remote close) resolve to whichever genuinely happened first.
+			private int _disconnectReason = (int)EDisconnectReason.None;
+			public EDisconnectReason        DisconnectReason             => (EDisconnectReason)_disconnectReason;
+			public WebSocketCloseStatus?    RemoteCloseStatus            { get; private set; } = null;  // populated on disconnect if the peer sent a close frame
+			public string?                  RemoteCloseStatusDescription { get; private set; } = null;
+			private void StampDisconnectReason(EDisconnectReason reason)
+			{
+				Interlocked.CompareExchange(ref _disconnectReason, (int)reason, (int)EDisconnectReason.None);  // first writer wins
+			}
 
 			private void SetLastError(string error)
 			{
-				_lastError = error;
-				_logger.Log(EVerbosity.Error, _lastError);
+				LastError = error;
+				_logger.Log(EVerbosity.Error, LastError);
 			}
 
 			// when we want to close, we push this through Send() so it knows to initiate closure.  Can be static because it's a sentinel, and compared by address.
@@ -84,29 +109,31 @@ namespace ReachableGames
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
 			public RGWebSocket(HttpListenerContext? httpContext, Func<RGWebSocket, PooledArray, bool, Task> onReceiveMsg, Func<RGWebSocket, Task> onDisconnectionCb, ILogging logger, string displayId, WebSocket webSocket, RGWebSocketConfig config)
 			{
-				if (onReceiveMsg==null || onDisconnectionCb==null)
-					throw new Exception("Cannot pass null in for callbacks.");
+				if (onReceiveMsg==null)
+					throw new ArgumentNullException(nameof(onReceiveMsg));
+				if (onDisconnectionCb==null)
+					throw new ArgumentNullException(nameof(onDisconnectionCb));
 				if (webSocket==null)
-					throw new Exception("Cannot pass null in for webSocket.");
+					throw new ArgumentNullException(nameof(webSocket));
 				if (logger==null)
-					throw new Exception("Cannot pass null in for logger.");
+					throw new ArgumentNullException(nameof(logger));
 				if (config==null)
-					throw new Exception("Cannot pass null in for config.  Pass RGWebSocketConfig.Default if you want the defaults.");
+					throw new ArgumentNullException(nameof(config), "Pass RGWebSocketConfig.Default if you want the defaults.");
 
 				_config = config;
 				_onReceiveMsgCb = onReceiveMsg;
 				_onDisconnectionCb = onDisconnectionCb;
 				_logger = logger;
-				_displayId = displayId;
-				_connectedAtTicks = DateTime.UtcNow.Ticks;
-				_lastRecvTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();  // a socket that never receives anything ages from its connection time
+				DisplayId = displayId;
+				ConnectedAtTicks = DateTime.UtcNow.Ticks;
+				LastRecvTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();  // a socket that never receives anything ages from its connection time
 				_httpContext = httpContext;
 				_webSocket = webSocket;
 
 				// NOTE: the constructor is pure wiring -- nothing runs and no callbacks can fire until Start() is called.
 
 #if RGWS_LOGGING
-				_logger.Log(EVerbosity.Extreme, $"{_displayId} RGWebSocket constructor");
+				_logger.Log(EVerbosity.Extreme, $"{DisplayId} RGWebSocket constructor");
 #endif
 			}
 
@@ -115,7 +142,7 @@ namespace ReachableGames
 			public void Start()
 			{
 				if (_started)
-					throw new Exception($"RGWebSocket.Start may only be called once. RGWSID={_displayId}");
+					throw new InvalidOperationException($"RGWebSocket.Start may only be called once. RGWSID={DisplayId}");
 				_started = true;
 				_recvTask = Task.Run(async () => await Recv(_cancellationTokenSource!.Token).ConfigureAwait(false));
 				_sendTask = Task.Run(async () => await Send(_cancellationTokenSource!.Token).ConfigureAwait(false));
@@ -124,7 +151,15 @@ namespace ReachableGames
 			// This is called by this program when we want to close the websocket.
 			public void Close()
 			{
-				// This always wakes up the send thread and tells it to close.				
+				// This always wakes up the send thread and tells it to close.
+				Send(sCloseOutputAsync);
+			}
+
+			// Same as Close(), but records WHY -- use this when policy is doing the closing (idle sweeps, kick commands, etc)
+			// so the disconnect shows up under the right cause instead of a generic LocalClose.
+			public void Close(EDisconnectReason reason)
+			{
+				StampDisconnectReason(reason);
 				Send(sCloseOutputAsync);
 			}
 
@@ -135,10 +170,11 @@ namespace ReachableGames
 			public async Task Shutdown()
 			{
 #if RGWS_LOGGING
-				_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} Shutdown called.");
+				_logger.Log(EVerbosity.Extreme, $"RGWSID={DisplayId} Shutdown called.");
 #endif
 				if (Interlocked.Exchange(ref _shutdownStarted, 1)==0)
 				{
+					StampDisconnectReason(EDisconnectReason.LocalShutdown);  // no-op if the socket already died for a real reason
 					try
 					{
 						_cancellationTokenSource!.Cancel();  // kills the Recv and Send tasks
@@ -149,7 +185,7 @@ namespace ReachableGames
 					{
 						// Break the websocket connection and drop all the held resources.  Note we intentionally do NOT call Task.Dispose()
 						// (unnecessary, and it has a history of throwing depending on task status), and we do NOT null the fields out,
-						// so stragglers reading _websocketState or _lastError after shutdown get sane answers instead of exceptions.
+						// so stragglers reading _websocketState or LastError after shutdown get sane answers instead of exceptions.
 						_webSocket!.Dispose();
 						try
 						{
@@ -161,7 +197,7 @@ namespace ReachableGames
 						_cancellationTokenSource!.Dispose();  // safe: IsCancellationRequested still reads true after disposal, which is all Send() looks at
 						_shutdownDone.TrySetResult(true);
 #if RGWS_LOGGING
-						_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} Shutdown completed.");
+						_logger.Log(EVerbosity.Extreme, $"RGWSID={DisplayId} Shutdown completed.");
 #endif
 					}
 				}
@@ -180,7 +216,8 @@ namespace ReachableGames
 						int unsentBytes = Interlocked.Add(ref _unsentBytes, binMsg.Length);
 						if (unsentBytes>_config.MaxUnsentBytes)  // slow consumer circuit breaker -- see RGWebSocketConfig.MaxUnsentBytes
 						{
-							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {_config.MaxUnsentBytes}).  Disconnecting slow consumer.");
+							SetLastError($"RGWSID={DisplayId} unsent queue hit {unsentBytes} bytes (limit {_config.MaxUnsentBytes}).  Disconnecting slow consumer.");
+							StampDisconnectReason(EDisconnectReason.OutboundBackpressure);
 							_cancellationTokenSource.Cancel();  // tears down both pumps; already-queued messages are drained and released by the send task's finally
 							return;  // this message is NOT queued (no IncRef happened) -- the connection is already dying
 						}
@@ -192,7 +229,7 @@ namespace ReachableGames
 				}
 				catch (Exception ex)
 				{
-					SetLastError($"SendInternalBin RGWSID={_displayId} {ex}");
+					SetLastError($"SendInternalBin RGWSID={DisplayId} {ex}");
 				}
 			}
 
@@ -209,7 +246,8 @@ namespace ReachableGames
 						int unsentBytes = Interlocked.Add(ref _unsentBytes, byteCount);
 						if (unsentBytes>_config.MaxUnsentBytes)  // slow consumer circuit breaker -- see RGWebSocketConfig.MaxUnsentBytes
 						{
-							SetLastError($"RGWSID={_displayId} unsent queue hit {unsentBytes} bytes (limit {_config.MaxUnsentBytes}).  Disconnecting slow consumer.");
+							SetLastError($"RGWSID={DisplayId} unsent queue hit {unsentBytes} bytes (limit {_config.MaxUnsentBytes}).  Disconnecting slow consumer.");
+							StampDisconnectReason(EDisconnectReason.OutboundBackpressure);
 							_cancellationTokenSource.Cancel();  // tears down both pumps; already-queued messages are drained and released by the send task's finally
 							return;  // this message is NOT queued (nothing was borrowed) -- the connection is already dying
 						}
@@ -222,7 +260,7 @@ namespace ReachableGames
 				}
 				catch (Exception ex)
 				{
-					SetLastError($"SendInternalText RGWSID={_displayId} {ex}");
+					SetLastError($"SendInternalText RGWSID={DisplayId} {ex}");
 				}
 			}
 
@@ -230,10 +268,16 @@ namespace ReachableGames
 			// Implementation details below this line
 
 			// This waits for data to show up, and when enough is collected, dispatch it to the app as a message buffer.
+			// Frames are received DIRECTLY into the tail of a pooled buffer, so a message that fits in the initial buffer costs zero
+			// managed copies.  Bigger messages grow by doubling out of the pool (borrow 2x, one BlockCopy, return the old bucket) --
+			// the same doubling List<byte> used to do on the GC heap, minus the garbage and minus the final copy into a PooledArray.
+			// The completed buffer IS the one handed to the application.
 			private async Task Recv(CancellationToken token)
 			{
-				byte[] recvBuffer = new byte[_config.ReceiveBufferBytes];
-				List<byte> messageBytes = new List<byte>(_config.ReceiveBufferBytes);  // start the buffer off with an allocation that is reasonable, to prevent a bunch of resizings
+				PooledArray accum = PooledArray.BorrowFromPool(_config.ReceiveBufferBytes);  // current message being assembled; also the recv target
+				int accumCount = 0;  // how many bytes of accum.data are filled (accum.Length is only set just before dispatch)
+				try
+				{
 				while (token.IsCancellationRequested==false)  // this loop is structured so the status of the ws may change and we still process everything in the incoming buffer until we hit the close.  Hence the soft exit.
 				{
 					switch (_webSocket!.State)
@@ -241,9 +285,11 @@ namespace ReachableGames
 						case WebSocketState.Closed:
 						case WebSocketState.Aborted:
 						case WebSocketState.None:
+							StampDisconnectReason(EDisconnectReason.TransportError);  // no-op if a real cause (close handshake, breaker, etc) was already stamped
 							_cancellationTokenSource!.Cancel();  // exits this task and kills the Send task
 							break;
 						case WebSocketState.CloseReceived:  // once CloseReceived, we are not allowed to ReceiveAsync on the websocket again.  The Send task replies CloseAsync to complete the handshake, then cancels everything.
+							StampDisconnectReason(EDisconnectReason.RemoteClose);
 							_releaseSendThread.Set();  // wake the send thread so it notices CloseReceived and sends the close reply
 							try
 							{
@@ -259,49 +305,66 @@ namespace ReachableGames
 						{
 							try
 							{
-								WebSocketReceiveResult recvResult = await _webSocket.ReceiveAsync(new ArraySegment<byte>(recvBuffer), token).ConfigureAwait(false);
-								_lastRecvTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();  // ANY inbound frame proves the connection is alive; raw ticks, zero conversion cost
+								// Make sure there's room for the next chunk BEFORE waiting for data.  Growth doubles out of the pool: one
+								// borrow, one copy, and the old bucket goes right back for reuse.  data.Length is always a power of two.
+								if (accumCount==accum.data.Length)
+								{
+									if (accumCount>=_config.MaxInboundMessageBytes)  // no point borrowing a bigger bucket for a message we already know is over the limit
+									{
+										SetLastError($"RGWSID={DisplayId} inbound message hit {accumCount} bytes (limit {_config.MaxInboundMessageBytes}).  Disconnecting abusive sender.");
+										StampDisconnectReason(EDisconnectReason.InboundOversize);
+										_cancellationTokenSource!.Cancel();  // exits both pumps; the partial message is never dispatched
+										break;
+									}
+									PooledArray bigger = PooledArray.BorrowFromPool(accum.data.Length * 2);
+									Buffer.BlockCopy(accum.data, 0, bigger.data, 0, accumCount);
+									using (accum) { }  // return the old bucket to the pool
+									accum = bigger;
+								}
+
+								ValueWebSocketReceiveResult recvResult = await _webSocket.ReceiveAsync(new Memory<byte>(accum.data, accumCount, accum.data.Length - accumCount), token).ConfigureAwait(false);  // struct result, zero allocation per chunk
+								LastRecvTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();  // ANY inbound frame proves the connection is alive; raw ticks, zero conversion cost
 
 								// I added a separate try/catch around user handler callbacks so errors in user code would not be able to cause this Task to exit.
-								if (recvResult!=null && recvResult.MessageType!=WebSocketMessageType.Close)
+								if (recvResult.MessageType==WebSocketMessageType.Close)
+								{
+									StampDisconnectReason(EDisconnectReason.RemoteClose);  // the peer sent a close frame; the state machine handles the rest
+								}
+								else
 								{
 									// assumption is that we don't get a mixture of binary and text for a single message
-									messageBytes.AddRange(new ArraySegment<byte>(recvBuffer, 0, recvResult.Count));
+									accumCount += recvResult.Count;  // the bytes were written straight into accum.data by ReceiveAsync
 
 									// Inbound circuit breaker -- see RGWebSocketConfig.MaxInboundMessageBytes.  Without this, one endless fragmented message OOMs the server.
-									if (messageBytes.Count > _config.MaxInboundMessageBytes)
+									if (accumCount > _config.MaxInboundMessageBytes)
 									{
-										SetLastError($"RGWSID={_displayId} inbound message hit {messageBytes.Count} bytes (limit {_config.MaxInboundMessageBytes}).  Disconnecting abusive sender.");
+										SetLastError($"RGWSID={DisplayId} inbound message hit {accumCount} bytes (limit {_config.MaxInboundMessageBytes}).  Disconnecting abusive sender.");
+										StampDisconnectReason(EDisconnectReason.InboundOversize);
 										_cancellationTokenSource!.Cancel();  // exits both pumps; the partial message is never dispatched
 									}
 									// If we now have the whole message, dispatch it (synchronously).  Ignore the final close message though.
 									else if (recvResult.EndOfMessage)
 									{
 										// keep stats
-										_stats_recvMsgs++;
-										_stats_recvBytes += messageBytes.Count;
+										RecvMessages++;
+										RecvBytes += accumCount;
 
-										// Tell the application about the message, then reset the buffer and keep going.
-										using (PooledArray byteArray = PooledArray.BorrowFromPool(messageBytes.Count))  // avoid new allocations, instead try to pull from a known-size pool of messages
+										// Tell the application about the message -- the accumulation buffer IS the message, no copy.
+										accum.Length = accumCount;
+										try
 										{
-											messageBytes.CopyTo(0, byteArray.data, 0, messageBytes.Count);
-											messageBytes.Clear();
-											if (messageBytes.Capacity > _config.LargeMessageResetBytes)  // Since the messageBytes array is internal to the websocket and never resizes smaller on its own, we manually do this to prevent one REALLY BIG message pinning a ton of memory until the socket closes.
-											{
-												messageBytes.Capacity = _config.ReceiveBufferBytes;  // reset this buffer to a reasonable size
-											}
-
-											try
-											{
-												// Text payloads are delivered as UTF8 bytes in the pooled buffer; the callback decodes only if it actually wants a string.
-												await _onReceiveMsgCb(this, byteArray, recvResult.MessageType==WebSocketMessageType.Text).ConfigureAwait(false);  // assume the message type doesn't change in the middle of a single message
-											}
-											catch (Exception e)  // handle any random exceptions that come from the logic someone might write.  If we don't do this, it silently swallows the errors and locks the websocket thread forever.
-											{
-												_cancellationTokenSource!.Cancel();  // exits this task and kills the Send task
-												SetLastError($"USER CODE EXCEPTION CAUGHT.  Closing connection RGWSID={_displayId} Recv: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {e}");
-											}
+											// Text payloads are delivered as UTF8 bytes in the pooled buffer; the callback decodes only if it actually wants a string.
+											await _onReceiveMsgCb(this, accum, recvResult.MessageType==WebSocketMessageType.Text).ConfigureAwait(false);  // assume the message type doesn't change in the middle of a single message
 										}
+										catch (Exception e)  // handle any random exceptions that come from the logic someone might write.  If we don't do this, it silently swallows the errors and locks the websocket thread forever.
+										{
+											StampDisconnectReason(EDisconnectReason.UserCodeException);
+											_cancellationTokenSource!.Cancel();  // exits this task and kills the Send task
+											SetLastError($"USER CODE EXCEPTION CAUGHT.  Closing connection RGWSID={DisplayId} Recv: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {e}");
+										}
+										using (accum) { }  // release our reference (consumers IncRef if they kept it) and start fresh for the next message
+										accum = PooledArray.BorrowFromPool(_config.ReceiveBufferBytes);
+										accumCount = 0;
 									}
 								}
 							}
@@ -310,22 +373,29 @@ namespace ReachableGames
 							}
 							catch (WebSocketException)  // happens when the peer vanishes without completing the handshake.  Terminal for the socket, so shut down instead of risking a hot loop on a broken pipe.
 							{
+								StampDisconnectReason(EDisconnectReason.TransportError);
 								_cancellationTokenSource!.Cancel();  // exits this task and kills the Send task
 							}
 							catch (Exception ex)  // if connection is prematurely closed, we get an exception from ReceiveAsync.
 							{
+								StampDisconnectReason(EDisconnectReason.TransportError);
 								_cancellationTokenSource!.Cancel();  // exits this task and kills the Send task
 								ex.Message.ToLower();  // avoid compiler warning
 #if RGWS_LOGGING
-								SetLastError($"RGWSID={_displayId} Recv: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
+								SetLastError($"RGWSID={DisplayId} Recv: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
 #endif
 							}
 							break;
 						}
 					}
 				}
+				}
+				finally
+				{
+					using (accum) { }  // whatever buffer was mid-assembly goes back to the pool
+				}
 #if RGWS_LOGGING
-				_logger.Log(EVerbosity.Extreme, $"RGWS.Recv exiting {_displayId}");
+				_logger.Log(EVerbosity.Extreme, $"RGWS.Recv exiting {DisplayId}");
 #endif
 			}
 
@@ -342,7 +412,7 @@ namespace ReachableGames
 						if (_webSocket.State!=lastState)
 						{
 #if RGWS_LOGGING
-							_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} State [{Enum.GetName(typeof(WebSocketState), lastState)}] -> [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}]");
+							_logger.Log(EVerbosity.Extreme, $"RGWSID={DisplayId} State [{Enum.GetName(typeof(WebSocketState), lastState)}] -> [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}]");
 #endif
 							lastState = _webSocket.State;
 						}
@@ -351,6 +421,7 @@ namespace ReachableGames
 							case WebSocketState.Closed:
 							case WebSocketState.Aborted:
 							case WebSocketState.None:
+								StampDisconnectReason(EDisconnectReason.TransportError);  // no-op if a real cause was already stamped
 								_cancellationTokenSource!.Cancel();  // exits this task and kills the Recv task
 								break;
 							case WebSocketState.CloseSent:  // we sent the close; give the peer a bounded window to reply with its own close (Recv is still listening), then tear down
@@ -369,6 +440,7 @@ namespace ReachableGames
 							case WebSocketState.CloseReceived:
 								try
 								{
+									StampDisconnectReason(EDisconnectReason.RemoteClose);
 									await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Remote initiated close", token).ConfigureAwait(false);
 									_cancellationTokenSource!.Cancel();  // exits this task and kills the Recv task
 								}
@@ -378,7 +450,7 @@ namespace ReachableGames
 								catch (Exception ex)
 								{
 									_cancellationTokenSource!.Cancel();  // exits this task and kills the Recv task
-									SetLastError($"Exception Caught at CloseReceived RGWSID={_displayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
+									SetLastError($"Exception Caught at CloseReceived RGWSID={DisplayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
 								}
 								break;
 							case WebSocketState.Connecting:  // do nothing while waiting to connect.
@@ -390,6 +462,7 @@ namespace ReachableGames
 								}
 								if (token.IsCancellationRequested==false && _webSocket.State == WebSocketState.Connecting)
 								{
+									StampDisconnectReason(EDisconnectReason.TransportError);
 									_cancellationTokenSource!.Cancel();  // still trying to connect, means something broke, tear it down
 								}
 								break;
@@ -409,9 +482,9 @@ namespace ReachableGames
 
 										// it's possible the state changed during one of the messages being sent
 										long deltaMillis = (long)(TimeSpan.FromTicks(DateTime.UtcNow.Ticks - qsm.enqueuedTick).TotalMilliseconds);
-										_stats_msgQueuedTime += deltaMillis;  // this is the total time this message was queued
+										QueuedTimeMS += deltaMillis;  // this is the total time this message was queued
 #if RGWS_LOGGING
-										_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} msg send queue time: {deltaMillis} ms");
+										_logger.Log(EVerbosity.Extreme, $"RGWSID={DisplayId} msg send queue time: {deltaMillis} ms");
 #endif
 										// Carefully null out the PooledArray in the asyncQueue on the off-chance we throw an exception part-way through this loop, we won't accidentally double-decrement any of them in the finally {}
 										asyncQueue[i] = kEmptyQSM;
@@ -419,6 +492,7 @@ namespace ReachableGames
 										{
 											if (qsm.binMsg!.Equals(sCloseOutputAsync))  // we want to close
 											{
+												StampDisconnectReason(EDisconnectReason.LocalClose);  // no-op if a policy reason (idle sweep, etc) was stamped by Close(reason)
 												await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Locally initiated close", token).ConfigureAwait(false);
 												_releaseSendThread.Set();  // make sure we do NOT park in WaitAsync below -- the loop must come back around and handle the CloseSent state
 
@@ -433,11 +507,11 @@ namespace ReachableGames
 											}
 											else
 											{
-												await _webSocket.SendAsync(new ArraySegment<byte>(qsm.binMsg.data, 0, qsm.binMsg.Length), qsm.isText ? WebSocketMessageType.Text : WebSocketMessageType.Binary, true, token).ConfigureAwait(false);
+												await _webSocket.SendAsync(new ReadOnlyMemory<byte>(qsm.binMsg.data, 0, qsm.binMsg.Length), qsm.isText ? WebSocketMessageType.Text : WebSocketMessageType.Binary, true, token).ConfigureAwait(false);  // ValueTask overload, no per-send allocation
 
 												// keep stats
-												_stats_sentMsgs++;
-												_stats_sentBytes += qsm.binMsg.Length;
+												SentMessages++;
+												SentBytes += qsm.binMsg.Length;
 												bytesSent += qsm.binMsg.Length;
 											}
 										}
@@ -450,8 +524,9 @@ namespace ReachableGames
 								}
 								catch (Exception e)
 								{
+									StampDisconnectReason(EDisconnectReason.TransportError);
 									_cancellationTokenSource!.Cancel();  // exits this task and kills the Recv task
-									SetLastError($"Exception caught in Open RGWSID={_displayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {e}");
+									SetLastError($"Exception caught in Open RGWSID={DisplayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {e}");
 								}
 
 								//-------------------
@@ -466,8 +541,9 @@ namespace ReachableGames
 								}
 								catch (Exception ex)
 								{
+									StampDisconnectReason(EDisconnectReason.TransportError);
 									_cancellationTokenSource!.Cancel();  // exits this task and kills the Recv task
-									SetLastError($"Exception caught at _releaseSendThread RGWSID={_displayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
+									SetLastError($"Exception caught at _releaseSendThread RGWSID={DisplayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
 								}
 								break;
 							}
@@ -477,12 +553,12 @@ namespace ReachableGames
 				finally
 				{
 #if RGWS_LOGGING
-					_logger.Log(EVerbosity.Extreme, $"RGWSID={_displayId} SendExit Beginning");
+					_logger.Log(EVerbosity.Extreme, $"RGWSID={DisplayId} SendExit Beginning");
 #endif
 
 					// must make sure we flag this as a dead socket
-					double totalSeconds = Math.Max(0.1, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - _connectedAtTicks).TotalSeconds);
-					long avgQueueDuration = _stats_msgQueuedTime / Math.Max(1, _stats_recvMsgs);
+					double totalSeconds = Math.Max(0.1, TimeSpan.FromTicks(DateTime.UtcNow.Ticks - ConnectedAtTicks).TotalSeconds);
+					long avgQueueDuration = QueuedTimeMS / Math.Max(1, RecvMessages);
 
 					// Wipe and free any unsent messages so we don't leak memory.
 					_outgoing.MoveTo(asyncQueue);
@@ -492,23 +568,33 @@ namespace ReachableGames
 						{
 						}
 					}
-					_logger.Log(EVerbosity.Debug, $"RGWSID={_displayId} ({Enum.GetName(typeof(WebSocketState), _webSocket!.State)}) SendExit Duration: {TimeSpan.FromSeconds(totalSeconds)} Recv: {_stats_recvMsgs}/{Utilities.BytesToHumanReadable(_stats_recvBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_recvBytes / totalSeconds))}/s Send: {_stats_sentMsgs}/{Utilities.BytesToHumanReadable(_stats_sentBytes)}/{Utilities.BytesToHumanReadable((long)(_stats_sentBytes / totalSeconds))}/s AvgRcvQueueDuration: {TimeSpan.FromMilliseconds(avgQueueDuration)} Unsent: {asyncQueue.Count}");
+					_logger.Log(EVerbosity.Debug, $"RGWSID={DisplayId} ({Enum.GetName(typeof(WebSocketState), _webSocket!.State)}) SendExit Duration: {TimeSpan.FromSeconds(totalSeconds)} Recv: {RecvMessages}/{Utilities.BytesToHumanReadable(RecvBytes)}/{Utilities.BytesToHumanReadable((long)(RecvBytes / totalSeconds))}/s Send: {SentMessages}/{Utilities.BytesToHumanReadable(SentBytes)}/{Utilities.BytesToHumanReadable((long)(SentBytes / totalSeconds))}/s AvgRcvQueueDuration: {TimeSpan.FromMilliseconds(avgQueueDuration)} Unsent: {asyncQueue.Count}");
 					asyncQueue.Clear();
+
+					// Capture the peer's close frame details (if any) while the websocket is still safe to touch -- after Shutdown
+					// disposes it, these properties may throw on some implementations.
+					try
+					{
+						RemoteCloseStatus = _webSocket.CloseStatus;
+						RemoteCloseStatusDescription = _webSocket.CloseStatusDescription;
+					}
+					catch (Exception)  // nothing useful to do; the socket may be in a hostile state
+					{
+					}
 
 					// Let the program know this socket is dead -- note this is on the Send thread, NOT main thread!!!
 					// This callback should do something simple like release a reaper thread, but not task switch.
 					// When reaping, always call Shutdown() first, to ensure this thread is done closing and changing status.
 					try
 					{
-						IsReadyForReaping = true;
 #if RGWS_LOGGING
-						_logger.Log(EVerbosity.Error, $"RGWS.Send calling onDisconnectionCb {_displayId}");
+						_logger.Log(EVerbosity.Error, $"RGWS.Send calling onDisconnectionCb {DisplayId}");
 #endif
 						await _onDisconnectionCb(this).ConfigureAwait(false);
 					}
 					catch (Exception e)
 					{
-						SetLastError($"Exception caught in _onDisconnectionCb RGWSID={_displayId} {e}");
+						SetLastError($"Exception caught in _onDisconnectionCb RGWSID={DisplayId} {e}");
 					}
 				}
 			}

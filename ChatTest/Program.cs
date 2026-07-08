@@ -94,7 +94,8 @@ namespace ReachableGames
 						IdleSweepPeriodSeconds = 1,
 					};
 					ChatConnectionManager mgr = new ChatConnectionManager(logger);
-					WebServer server = new WebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, logger, config);
+					TestDataCollection dataCollection = new TestDataCollection();  // proves the IDataCollection conformance -- a real app would pass a prometheus-backed derivative
+					WebServer server = new WebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, logger, config, dataCollection);
 					server.RegisterExactEndpoint("/status", (ctx) => Task.FromResult((200, "text/plain", System.Text.Encoding.UTF8.GetBytes($"connections={mgr.CurrentCount}"))));
 					try
 					{
@@ -334,8 +335,14 @@ namespace ReachableGames
 					Console.WriteLine($"Chat binary:          sent={binariesSent} received={binariesReceived} ({Utilities.BytesToHumanReadable(binaryBytes)}) corrupt={binaryCorrupt}");
 					Console.WriteLine($"Client-visible errs:  serverErrors={serverErrors} (whisper misses are normal) unknownMsgs={unknownMsgs} clientFatals={fatals}");
 					Console.WriteLine(mgr.StatsString());
+					Console.WriteLine("--------------- server distribution metrics ---------------");
+					Console.WriteLine(server.Metrics.Report());
+					Console.WriteLine("--------------- IDataCollection (prometheus sink) ----------");
+					Console.WriteLine(System.Text.Encoding.UTF8.GetString(await dataCollection.Generate().ConfigureAwait(false)).TrimEnd());
+					Console.WriteLine("------------------------------------------------------------");
 					Console.WriteLine($"Logged Error lines:   {logger.ErrorCount} (abrupt deaths make some of these expected)");
 					Console.WriteLine($"PooledArray live:     {liveAllocs} buffers / {Utilities.BytesToHumanReadable(liveAllocSize)} (expected: 1 buffer / 128B -- the close sentinel)");
+					Console.WriteLine($"GC totals:            allocated={Utilities.BytesToHumanReadable(GC.GetTotalAllocatedBytes())} collections gen0={GC.CollectionCount(0)} gen1={GC.CollectionCount(1)} gen2={GC.CollectionCount(2)}");
 					Console.WriteLine();
 
 					//-------------------
@@ -359,6 +366,21 @@ namespace ReachableGames
 					if (zombieDiscoed==false)                   failures.Add("phase 2: slow consumer was never disconnected -- the unsent-bytes circuit breaker did not trip");
 					if (oversizeDiscoed==false)                 failures.Add("phase 3: oversize sender was never disconnected -- the inbound message limit did not trip");
 					if (lurkerSwept==false)                     failures.Add("phase 4: idle lurker was never disconnected -- the idle sweep did not work");
+					// The engineered kills must be attributed to the RIGHT cause, not just counted as generic deaths.
+					if (server.Metrics.GetDisconnectCount(EDisconnectReason.OutboundBackpressure)!=1) failures.Add($"disconnect causes: expected exactly 1 OutboundBackpressure, saw {server.Metrics.GetDisconnectCount(EDisconnectReason.OutboundBackpressure)}");
+					if (server.Metrics.GetDisconnectCount(EDisconnectReason.InboundOversize)!=1)      failures.Add($"disconnect causes: expected exactly 1 InboundOversize, saw {server.Metrics.GetDisconnectCount(EDisconnectReason.InboundOversize)}");
+					if (server.Metrics.GetDisconnectCount(EDisconnectReason.IdleTimeout)!=1)          failures.Add($"disconnect causes: expected exactly 1 IdleTimeout, saw {server.Metrics.GetDisconnectCount(EDisconnectReason.IdleTimeout)}");
+					if (server.Metrics.HighWaterConnections<8)  failures.Add($"metrics: high water connections {server.Metrics.HighWaterConnections} is implausibly low");
+					if (server.Metrics.CurrentConnections!=0)   failures.Add($"metrics: current connections {server.Metrics.CurrentConnections} != 0 after shutdown");
+					// The IDataCollection sink must agree with the internal metrics -- this is the prometheus conformance check.
+					if (dataCollection.GetCounter("rgws_disconnects_outbound_backpressure_total")!=1)                    failures.Add("IDataCollection: outbound backpressure counter != 1");
+					if (dataCollection.GetCounter("rgws_disconnects_inbound_oversize_total")!=1)                         failures.Add("IDataCollection: inbound oversize counter != 1");
+					if (dataCollection.GetCounter("rgws_disconnects_idle_timeout_total")!=1)                             failures.Add("IDataCollection: idle timeout counter != 1");
+					if (dataCollection.GetCounter("rgws_connections_accepted_total")!=server.Metrics.TotalAccepted)      failures.Add("IDataCollection: accepted counter disagrees with internal metrics");
+					if (dataCollection.GetGauge("rgws_connections_current")!=0)                                          failures.Add("IDataCollection: current connections gauge != 0 after shutdown");
+					if (dataCollection.GetGauge("rgws_connections_high_water")!=server.Metrics.HighWaterConnections)     failures.Add("IDataCollection: high water gauge disagrees with internal metrics");
+					if (dataCollection.GetHistogramCount("rgws_inbound_message_bytes")!=server.Metrics.InboundMsgBytes.Count) failures.Add("IDataCollection: inbound histogram count disagrees with internal metrics");
+					if (dataCollection.GetHistogramCount("rgws_connection_duration_seconds")!=server.Metrics.TotalAccepted)  failures.Add("IDataCollection: duration histogram count != total accepted");
 					if (connectedBeforeShutdown<8)              failures.Add($"phase 5 only had {connectedBeforeShutdown} clients connected at server shutdown (expected 8)");
 					if (lingerersHung)                          failures.Add("phase 5 clients did not exit within 15s of server shutdown");
 					if (afterShutdownCount>0)                   failures.Add($"phase 5: server still tracked {afterShutdownCount} connections after shutdown");

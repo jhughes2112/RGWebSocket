@@ -116,7 +116,8 @@ IConnectionManager connectionMgr = new YourConnectionManager();
 // Create a new WebSocket server instance on a port.  RGWebSocketConfig carries all the tunable limits; a game
 // server probably wants the idle sweep on, so clients that vanish behind an Ingress get cleaned up:
 RGWebSocketConfig config = new RGWebSocketConfig() { IdleDisconnectSeconds = 300 };  // clients must heartbeat within 5 minutes
-WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, config);
+IDataCollection? dataCollection = null;  // or pass your prometheus-backed IDataCollection derivative to have metrics pushed into it
+WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, config, dataCollection);
 webServer.RegisterExactEndpoint("/status", async (context) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")));
 
 // Start listening.  This returns immediately; the listener runs on its own tasks.
@@ -128,6 +129,23 @@ while (Console.ReadKey().KeyChar!='X') {}
 // Stop the web server, which tells the IConnectionManager to shutdown all the connections
 await webServer.Shutdown().ConfigureAwait(false);
 ```
+
+## Threading contract
+
+Knowing which thread runs your code is most of the battle with this kind of library, so here it is in one place:
+
+- `RGWebSocket.Send()` (both overloads) is safe to call from **any thread** at any time.  Messages are queued and a dedicated send task drains them in order.
+- `IConnectionManager.OnReceiveText`/`OnReceiveBinary` run on **that socket's receive task**.  One message at a time per socket, but different sockets call you **concurrently** -- anything they touch that is shared must be thread-safe.  Do not block in these callbacks (no sync waits on other locks, DBs, etc); you stall that socket's receive pump and, at scale, the thread pool.
+- `IConnectionManager.OnConnection` runs before the socket's pumps start -- nothing can arrive until you return.
+- `IConnectionManager.OnDisconnect` runs on **the dying socket's send task**.  Never call `RGWebSocket.Shutdown()` from there (it would wait for itself); `WebSocketServer` hands the socket to a reaper task that disposes it from outside.
+- `UnityWebSocket` queues everything; you drain with `ReceiveAll()` from **your main thread** whenever you like.  The `disconnectCallback` fires on the socket's send task -- set flags, don't touch your world state from it.
+- `WebServer` HTTP endpoint handlers run on thread pool tasks, one per request, bounded by the connection timeout.
+
+## Disconnect causes and metrics
+
+Every socket records **why** it died (`RGWebSocket.DisconnectReason`): remote close (with the peer's close status/description), transport error, the outbound/inbound circuit breakers, idle timeout, user code exception, or local close/shutdown.  `WebSocketServer.Metrics` aggregates distribution-oriented server metrics -- current/high-water concurrents, disconnect counts by cause, and power-of-two histograms (count/min/mean/p50/p90/p99/max) for inbound message sizes, per-socket lifetime send/receive counts and bytes, and connection duration.  Wire `Metrics.Report()` to an HTTP endpoint via `RegisterExactEndpoint` and you have a health page.
+
+For prometheus/Grafana, implement `IDataCollection` (gauges, counters, histograms) and pass it to `WebServer`/`WebSocketServer`; the library registers `rgws_*` metrics at startup and pushes events as they happen (connect/disconnect gauges and per-cause counters, message-size and per-socket-lifetime histograms, connection duration in seconds).  Your derivative owns `Generate()`; the library never formats a metrics page itself.
 
 ## Testing
 

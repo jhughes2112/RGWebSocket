@@ -4,6 +4,7 @@
 // Copyright 2023
 //-------------------
 
+using DataCollection;
 using Logging;
 using System;
 using System.Collections.Generic;
@@ -22,9 +23,12 @@ namespace ReachableGames
 			private readonly ILogging            _logger;
 			private WebSocketServer              _httpServer;
 
+			public WebSocketServerMetrics        Metrics => _httpServer.Metrics;  // distribution-oriented server metrics, updated live
+
 			//-------------------
 
-			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config)
+			// dataCollection is nullable ON PURPOSE: pass your IDataCollection derivative to feed prometheus, or null explicitly.
+			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config, IDataCollection? dataCollection)
 			{
 				_url                 = url;
 				_logger              = logger;
@@ -35,7 +39,7 @@ namespace ReachableGames
 				if (_urlPathPrefix.EndsWith("/", StringComparison.Ordinal)==false)
 					_urlPathPrefix += "/";
 
-				_httpServer = new WebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger, config);
+				_httpServer = new WebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger, config, dataCollection);
 			}
 
 			//-------------------
@@ -43,7 +47,7 @@ namespace ReachableGames
 			public void Start()
 			{
 				if (_httpServer.IsListening())
-					throw new Exception($"WebServer.Start is already listening at {_url}");
+					throw new InvalidOperationException($"WebServer.Start is already listening at {_url}");
 
 				try
 				{
@@ -68,7 +72,7 @@ namespace ReachableGames
 			public async Task Shutdown()
 			{
 				await _httpServer.StopListening().ConfigureAwait(false);  // kill all the connections and abort any that don't die quietly
-				_logger.Log(EVerbosity.Error, $"WebServer.Shutdown at {_url}");
+				_logger.Log(EVerbosity.Warning, $"WebServer.Shutdown at {_url}");  // Warning matches Start's level -- a normal shutdown is noteworthy, not an error
 			}
 
 			//-------------------
