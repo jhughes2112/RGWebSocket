@@ -1,41 +1,31 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <RootNamespace>ReachableGames.RGWebSocketUnity</RootNamespace>
+    <Version>1.0.26</Version>
+    <AssemblyVersion>$(Version)</AssemblyVersion>
+    <Authors>Jason Hughes</Authors>
+    <Company>Reachable Games LLC</Company>
+    <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
+    <Description>A clean Unity-friendly package that provides a single-threaded simple interface to websockets, based on .NET Standard 2.1.</Description>
     <ApplicationIcon>reachablegames.ico</ApplicationIcon>
-    <Copyright>Copyright 2023 Reachable Games LLC</Copyright>
-    <Description>A clean Unity-friendly package that provides a single-threaded simple interface to websockets, based on .NET Standard. 2.1</Description>
-    <PackageIcon>reachablegames.png</PackageIcon>
     <SignAssembly>true</SignAssembly>
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
-    <Platforms>AnyCPU</Platforms>
-
-	<VersionSuffix>1.0.26</VersionSuffix>
-	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
-	<Version>$(VersionSuffix)</Version>
-	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-	<PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
-	<PackageLicenseExpression>MIT</PackageLicenseExpression>
-	<PackageReadmeFile>readme.md</PackageReadmeFile>
+    <DelaySign>false</DelaySign>
+    <Nullable>disable</Nullable>
+    <!-- CS8002: Nito.AsyncEx is not strong-named.  Unity/Mono/.NET Core do not enforce strong-name loading, so this is harmless. -->
+    <NoWarn>$(NoWarn);CS8002</NoWarn>
   </PropertyGroup>
 
   <PropertyGroup>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageIcon>reachablegames.png</PackageIcon>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>readme.md</PackageReadmeFile>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    <Company>Reachable Games LLC</Company>
-    <Authors>Jason Hughes</Authors>
-    <DelaySign>false</DelaySign>
-    <Nullable>disable</Nullable>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Any CPU'">
-    <Optimize>false</Optimize>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Any CPU'">
-    <DefineConstants>TRACE</DefineConstants>
-    <PlatformTarget>AnyCPU</PlatformTarget>
   </PropertyGroup>
 
   <ItemGroup>
@@ -46,18 +36,15 @@
     <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
     <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
-	<None Include="..\readme.md" Pack="true" PackagePath="\"/>
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="reachablegames.png">
-      <Pack>True</Pack>
-      <PackagePath></PackagePath>
-    </None>
+    <None Include="..\readme.md" Pack="true" PackagePath="\" />
+    <None Include="reachablegames.png" Pack="true" PackagePath="" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Nito.AsyncEx.Coordination" Version="5.1.0" />
+    <PackageReference Include="Nito.AsyncEx.Coordination" Version="5.1.2" />
   </ItemGroup>
 
 </Project>

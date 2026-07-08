@@ -40,7 +40,7 @@ namespace ReachableGames
 			public void Start()
 			{
 				if (_httpServer.IsListening())
-					throw new Exception("WebServer.Start is already listening at {_url}");
+					throw new Exception($"WebServer.Start is already listening at {_url}");
 
 				try
 				{

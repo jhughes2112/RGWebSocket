@@ -3,44 +3,27 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>ReachableGames.RGWebSocket</RootNamespace>
-    <ApplicationIcon>reachablegames.ico</ApplicationIcon>
-    <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
-    <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 10, suitable for servers.</Description>
-    <PackageIcon>reachablegames.png</PackageIcon>
-    <SignAssembly>true</SignAssembly>
-    <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
-    <Platforms>AnyCPU</Platforms>
-	
-	<VersionSuffix>1.0.26</VersionSuffix>
-	<AssemblyVersion>$(VersionSuffix)</AssemblyVersion>
-	<Version>$(VersionSuffix)</Version>
-	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-	<PackageLicenseExpression>MIT</PackageLicenseExpression>
-	<PackageReadmeFile>readme.md</PackageReadmeFile>
-  </PropertyGroup>
-
-  <PropertyGroup>
-    <IncludeSymbols>true</IncludeSymbols>
-    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Version>1.0.26</Version>
+    <AssemblyVersion>$(Version)</AssemblyVersion>
     <Authors>Jason Hughes</Authors>
     <Company>Reachable Games LLC</Company>
+    <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
+    <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 10, suitable for servers.</Description>
+    <ApplicationIcon>reachablegames.ico</ApplicationIcon>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <DelaySign>false</DelaySign>
     <Nullable>disable</Nullable>
   </PropertyGroup>
 
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Any CPU'">
-    <Optimize>false</Optimize>
+  <PropertyGroup>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageIcon>reachablegames.png</PackageIcon>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>readme.md</PackageReadmeFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Any CPU'">
-    <WarningLevel>0</WarningLevel>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <Compile Remove="publish\**" />
-    <EmbeddedResource Remove="publish\**" />
-    <None Remove="publish\**" />
-  </ItemGroup>
 
   <ItemGroup>
     <Compile Include="..\CancellationTokenAwaiter.cs" Link="CancellationTokenAwaiter.cs" />
@@ -48,30 +31,21 @@
     <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
     <Compile Include="..\LockingList.cs" Link="LockingList.cs" />
     <Compile Include="..\PooledArray.cs" Link="PooledArray.cs" />
-    <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
     <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
+    <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
     <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
     <Compile Include="..\WebServer.cs" Link="WebServer.cs" />
     <Compile Include="..\WebSocketServer.cs" Link="WebSocketServer.cs" />
-	<None Include="..\readme.md" Pack="true" PackagePath="\"/>
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="reachablegames.png">
-      <Pack>True</Pack>
-      <PackagePath></PackagePath>
-    </None>
+    <None Include="..\readme.md" Pack="true" PackagePath="\" />
+    <None Include="reachablegames.png" Pack="true" PackagePath="" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Nito.AsyncEx.Coordination" Version="5.1.2" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <EmbeddedResource Update="Properties\Resources.resx">
-      <Generator>ResXFileCodeGenerator</Generator>
-    </EmbeddedResource>
   </ItemGroup>
 
 </Project>

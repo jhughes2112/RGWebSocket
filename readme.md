@@ -1,16 +1,17 @@
 # RGWebSocket - WebSocket Library for C# and Unity
 
-RGWebsocketUnity is a powerful and user-friendly C# library that simplifies the process of building WebSocket clients in C#, and is suitable for direct integration into Unity.
-RGWebSocket is a similarly powerful and user-friendly C# library for building high-performance and multi-threaded WebSocket servers in C#.  Both libraries reduce the complexities involved in handling WebSocket communications down to simple Connect/Disconnect/Send/Receive calls without you needing to worry about the details of handling WebSocket states.
+RGWebSocketUnity is a powerful and user-friendly C# library that simplifies the process of building WebSocket clients in C#, and is suitable for direct integration into Unity (.NET Standard 2.1).
+RGWebSocket is a similarly powerful and user-friendly C# library for building high-performance and multi-threaded WebSocket servers in C# (.NET 10).  Both libraries reduce the complexities involved in handling WebSocket communications down to simple Connect/Disconnect/Send/Receive calls without you needing to worry about the details of handling WebSocket states.
 
 ## Features
 
-- Provides a basic HTTP server that allows you to register functions to handle specific URL paths.
+- Provides a basic HTTP server that allows you to register functions to handle specific URL paths (exact and prefix matching).
 - Automatically upgrades basic HTTP connections to WebSocket connections.
 - Easy-to-use WebSocket client implementation for C# and Unity.
 - Simplified WebSocket server creation in C# with multi-threading support.
+- Text and binary messages flow through one pooled-buffer path -- no per-message allocations in the steady state.
 - Abstracts away the complexities of WebSocket communication, allowing you to focus on your application logic.
-- Compatible with standard WebSockets, since it is built on top of System.Net.WebSocket, including ws:// and wss:// protocols.
+- Compatible with standard WebSockets, since it is built on top of System.Net.WebSockets, including ws:// and wss:// protocols.
 
 ## Installation
 
@@ -31,19 +32,35 @@ Install-Package RGWebSocket
 
 ## Usage
 
-### WebSocket Client
+### Logging
 
-RGWebSocket makes it incredibly easy to set up a WebSocket client in your C# or Unity project. Follow these simple steps:
+Both libraries log through a tiny `ILogging` interface, so you can route messages into whatever logging system your app uses:
 
 ```csharp
+using Logging;
+
+public class ConsoleLogger : ILogging
+{
+	public EVerbosity Verbosity { get; set; } = EVerbosity.Warning;
+	public void Log(EVerbosity level, string msg) { if (level<=Verbosity) Console.WriteLine($"[{level}] {msg}"); }
+	public void Dispose() {}
+}
+```
+
+### WebSocket Client
+
+RGWebSocket makes it incredibly easy to set up a WebSocket client in your C# or Unity project.  The client is poll-based: callbacks queue messages up on background threads, and you drain them from your main thread (e.g. a MonoBehaviour.Update).
+
+```csharp
+using Logging;
 using ReachableGames.RGWebSocket;
 
-OnLogDelegate logger = (ELogVerboseType lvl, string msg) => { Console.WriteLine(msg) };
-Action<UnityWebSocket> disconnectCallback = (UnityWebSocket uws) => { Console.WriteLine("Disconnected" };
-int connectTimeoutMs = 3000;
+ILogging logger = new ConsoleLogger();
+Action<UnityWebSocket> disconnectCallback = (UnityWebSocket uws) => { Console.WriteLine("Disconnected"); };
+int connectTimeoutMS = 3000;
 
 // Create a new WebSocket client instance
-UnityWebSocket client = UnityWebSocket(logger, "Client", disconnectCallback, connectTimeoutMs);
+UnityWebSocket client = new UnityWebSocket(logger, "Client", disconnectCallback, connectTimeoutMS);
 
 // Connect to the WebSocket server
 Dictionary<string, string> headers = new Dictionary<string, string>();
@@ -51,52 +68,75 @@ await client.Connect("wss://your-websocket-server.com", headers).ConfigureAwait(
 
 if (client.IsConnected)
 {
-	// Send a message, does not block
+	// Send a text or binary message, does not block
 	client.Send("Mary had a little lamb.");
 
-	// Receive any waiting messages, does not block
+	// Receive any waiting messages, does not block.  You own every message you receive and must dispose
+	// each one to return its buffer to the pool.  isText tells you whether to read .Text or the raw bytes.
 	List<UnityWebSocket.wsMessage> inboundMessages = new List<UnityWebSocket.wsMessage>();
 	client.ReceiveAll(inboundMessages);
+	foreach (UnityWebSocket.wsMessage m in inboundMessages)
+	{
+		using (m.msg)  // returns the pooled buffer when done
+		{
+			if (m.isText)
+				Console.WriteLine(m.Text);
+			else
+				HandleBinary(m.msg.data, m.msg.Length);
+		}
+	}
+	inboundMessages.Clear();
 
-	// Kindly disconnect from the server
+	// Kindly disconnect from the server (performs the close handshake)
 	client.Close();
-	
-	// Forcibly abort the connection, release memory, and prepare for new a Connect call
+
+	// Forcibly abort whatever remains, release memory, and prepare for a new Connect/Reconnect call
 	client.Shutdown();
 }
 ```
 
 ### WebSocket Server
 
-Creating a multi-threaded WebSocket server with RGWebSocket is just as simple:
+Creating a multi-threaded WebSocket server with RGWebSocket is just as simple.  Implement `IConnectionManager` to track your connections, then:
 
 ```csharp
+using Logging;
 using ReachableGames.RGWebSocket;
 
-OnLogDelegate logger = (ELogVerboseType lvl, string msg) => { Console.WriteLine(msg) };
+ILogging logger = new ConsoleLogger();
 int listenerTasks = 20;
-int connectionTimeoutMs = 3000;
+int connectionTimeoutMS = 3000;
 int idleSeconds = 60;
 
-// Make the connection manager, which is told when a new websocket is connected and is also 
-// responsible for closing them if the server shuts down
+// Make the connection manager, which is told when a new websocket is connected and is also
+// responsible for closing them all if the server shuts down
 IConnectionManager connectionMgr = new YourConnectionManager();
 
-// Create a new WebSocket server instance on port
+// Create a new WebSocket server instance on a port.  Ordinary HTTP requests can be handled too:
 WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger);
+webServer.RegisterExactEndpoint("/status", async (context) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")));
 
-// Start the WebSocket server and run it until you hit the X key
-Task webTask = Task.Run(webServer.Start);
+// Start listening.  This returns immediately; the listener runs on its own tasks.
+webServer.Start();
+
+// Run until you hit the X key
 while (Console.ReadKey().KeyChar!='X') {}
 
 // Stop the web server, which tells the IConnectionManager to shutdown all the connections
-webServer.Shutdown();
-await webTask.ConfigureAwait(false);
+await webServer.Shutdown().ConfigureAwait(false);
+```
+
+## Testing
+
+The repository contains a chat-style stress test (`ChatTest`) that spins up a server and dozens of in-process clients that broadcast, whisper, exchange binary blobs, disconnect gracefully, die abruptly, and reconnect -- then verifies that no connections or pooled buffers leak:
+
+```bash
+dotnet run --project ChatTest -- clients=48 seed=12345
 ```
 
 ## Documentation
 
-I wish there was more documentation for this library, but I haven't had time to write any yet.  It's still in development, although I suspect the rate of change is slowing.  The best guide for now is code in WebServer.cs and UnityWebSocket.cs and IConnectionManager.cs or ask questions.
+I wish there was more documentation for this library, but I haven't had time to write any yet.  It's still in development, although I suspect the rate of change is slowing.  The best guide for now is code in WebServer.cs and UnityWebSocket.cs and IConnectionManager.cs, the ChatTest example, or ask questions.
 
 ## Contributing
 
@@ -105,4 +145,3 @@ Although we welcome contributions to RGWebSocket, this is being used in several 
 ## License
 
 RGWebSocket is released under the [MIT License](https://opensource.org/licenses/MIT).
-

@@ -280,12 +280,12 @@ namespace ReachableGames
 					}
 				}
 #if RGWS_LOGGING
-				_logger.Log(EVerbosity.ExtremelyVerbose, $"RGWS.Recv exiting {_displayId}");
+				_logger.Log(EVerbosity.Extreme, $"RGWS.Recv exiting {_displayId}");
 #endif
 			}
 
 			// This task will run until the socket closes or is canceled, then it exits.
-			private QueuedSendMsg kEmptyQSM = new QueuedSendMsg();
+			static private readonly QueuedSendMsg kEmptyQSM = new QueuedSendMsg();
 			private async Task Send(CancellationToken token)
 			{
 				List<QueuedSendMsg> asyncQueue = new List<QueuedSendMsg>();  // this is where we copy the structs during the locking of the queue, so we can send them async outside the lock and unblock the send queue

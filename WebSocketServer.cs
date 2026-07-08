@@ -12,7 +12,6 @@ using System.Threading.Tasks;
 using System.Net.WebSockets;
 using System.Diagnostics;
 using Logging;
-using Nito.AsyncEx;
 
 namespace ReachableGames
 {
