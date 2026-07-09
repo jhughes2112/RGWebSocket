@@ -22,7 +22,7 @@ namespace ReachableGames
 		// This class handles setting up the listener tasks, handling HTTP(S)/WS(S) connections, deciding if they are http or websocket and upgrading them,
 		// and making the appropriate callbacks to upstream code, managing the shutdown process, etc.  Note, this class owns the actual RGWebSocket connections.
 		// Anytime a HttpListener is stopped, it aborts all the websocket connections.
-		public class WebSocketServer : IDisposable
+		public class RGWebSocketServer : IDisposable
 		{		
 			public delegate Task OnHttpRequest(HttpListenerContext httpContext);
 
@@ -32,8 +32,7 @@ namespace ReachableGames
 			private string                    _prefixURL;
 			private OnHttpRequest             _httpRequestCallback;
 			private ILogging                  _logger;
-			private IConnectionManager        _connectionManager;
-			private RGWebSocketConfig         _config;
+			private RGConnectionManager       _connectionManager;
 
 			// Distribution-oriented server metrics, fed automatically.  Read live any time, e.g. from a /metrics endpoint handler.
 			public WebSocketServerMetrics     Metrics { get; } = new WebSocketServerMetrics();
@@ -58,14 +57,13 @@ namespace ReachableGames
 			// httpRequest callback allows you to handle ordinary non-websocket HTTP requests however you want, even at the same url
 			// dataCollection is nullable ON PURPOSE (not a default parameter): pass your IDataCollection derivative to have
 			// connection/disconnect/message metrics pushed into it for prometheus scraping, or pass null explicitly if you don't.
-			public WebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config, IDataCollection? dataCollection)
+			public RGWebSocketServer(int listenerTasks, int connectionMS, int idleSeconds, string prefixURL, OnHttpRequest httpRequest, RGConnectionManager connectionManager, ILogging logger, IDataCollection? dataCollection)
 			{
 				if (logger==null)
 					throw new ArgumentNullException(nameof(logger));
 				if (connectionManager==null)
 					throw new ArgumentNullException(nameof(connectionManager));
-				if (config==null)
-					throw new ArgumentNullException(nameof(config), "Pass RGWebSocketConfig.Default if you want the defaults.");
+				RGWebSocketConfig.MarkInUse();  // from here on, Configure() throws -- the sweep and sockets read the config unsynchronized
 				if (dataCollection!=null)
 					Metrics.AttachDataCollection(dataCollection);
 				_listenerTasks       = listenerTasks;
@@ -75,7 +73,6 @@ namespace ReachableGames
 				_logger              = logger;
 				_connectionManager   = connectionManager;
 				_idleSeconds         = idleSeconds;
-				_config              = config;
 			}
 
 			public void Dispose()
@@ -100,7 +97,7 @@ namespace ReachableGames
 					_listener.Start();
 					_reaperCancel = new CancellationTokenSource();
 					_reaperTask = Task.Run(async () => await ReaperLoop(_reaperCancel.Token).ConfigureAwait(false));  // disposes dead sockets for the lifetime of the listener
-					if (_config.IdleDisconnectSeconds>0)
+					if (RGWebSocketConfig.IdleDisconnectSeconds>0)
 						_sweepTask = Task.Run(async () => await IdleSweep(_reaperCancel.Token).ConfigureAwait(false));  // disconnects silent sockets, since transport idle timeouts can't be trusted
 					_listenerUpdateTask = Task.Run(async () => await ListenerUpdate(_listenerTasks).ConfigureAwait(false));  // simply run the listener in a separate thread, so any websocketserver has its own cpu time dedicated
 					_logger.Log(EVerbosity.Info, "WebSocketServer.Start");
@@ -172,19 +169,19 @@ namespace ReachableGames
 				{
 					try
 					{
-						await Task.Delay(_config.IdleSweepPeriodSeconds*1000, token).ConfigureAwait(false);
+						await Task.Delay(RGWebSocketConfig.IdleSweepPeriodSeconds*1000, token).ConfigureAwait(false);
 					}
 					catch (OperationCanceledException)  // not an error, flow control
 					{
 						break;
 					}
 					// All the unit conversion happens HERE, once per sweep pass -- the per-frame stamp in RGWebSocket is just a raw clock read.
-					long idleTimestampTicks = _config.IdleDisconnectSeconds * Stopwatch.Frequency;
+					long idleTimestampTicks = RGWebSocketConfig.IdleDisconnectSeconds * Stopwatch.Frequency;
 					long now = Stopwatch.GetTimestamp();  // monotonic, immune to the NTP clock corrections that are common in containers/VMs
 					_liveSockets.Foreach((rgws, unused) => { if (now - rgws.LastRecvTimestamp > idleTimestampTicks) _sweepWorking.Add(rgws); });  // collect under the read lock, act outside it
 					for (int i=0; i<_sweepWorking.Count; i++)
 					{
-						_logger.Log(EVerbosity.Warning, $"WebSocketServer.IdleSweep disconnecting {_sweepWorking[i].DisplayId} (nothing received for over {_config.IdleDisconnectSeconds}s)");
+						_logger.Log(EVerbosity.Warning, $"WebSocketServer.IdleSweep disconnecting {_sweepWorking[i].DisplayId} (nothing received for over {RGWebSocketConfig.IdleDisconnectSeconds}s)");
 						_sweepWorking[i].Close(EDisconnectReason.IdleTimeout);  // tagged so the disconnect metrics tell the true story
 					}
 					_sweepWorking.Clear();
@@ -325,7 +322,7 @@ namespace ReachableGames
 							// Note, we hook our own OnReceive/OnDisconnect before proxying it on to the ConnectionManager.  The constructor is inert:
 							// the connection manager gets to register the socket FIRST, and only then does Start() spin up the pumps, so no
 							// callback can ever race the registration.
-							RGWebSocket rgws = new RGWebSocket(httpContext, OnReceive, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, _config);
+							RGWebSocket rgws = new RGWebSocket(httpContext, OnReceive, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
 							bool recordedConnect = false;
 							try
 							{
@@ -397,13 +394,12 @@ namespace ReachableGames
 				}
 			}
 
-			// The core delivers text messages as UTF8 bytes in a pooled buffer; decode here at the edge, since IConnectionManager wants strings for text.
+			// Hand every message to the manager raw -- RGConnectionManager's default OnRawMessage IS the typed pipeline, and
+			// raw-mode managers override it and decode however they like (nothing is eagerly stringified here anymore).
 			private Task OnReceive(RGWebSocket rgws, PooledArray msg, bool isText)
 			{
 				Metrics.RecordInboundMessage(msg.Length);
-				if (isText)
-					return _connectionManager.OnReceiveText(rgws, System.Text.Encoding.UTF8.GetString(msg.data, 0, msg.Length));
-				return _connectionManager.OnReceiveBinary(rgws, msg);
+				return _connectionManager.OnRawMessage(rgws, msg, isText);
 			}
 
 			// Add this websocket to the list of those we need to remove and unblock the cleanup thread

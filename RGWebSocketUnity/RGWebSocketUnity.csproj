@@ -31,10 +31,11 @@
     <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
     <Compile Include="..\LockingList.cs" Link="LockingList.cs" />
     <Compile Include="..\PooledArray.cs" Link="PooledArray.cs" />
+    <Compile Include="..\RGMessage.cs" Link="RGMessage.cs" />
+    <Compile Include="..\RGUnityWebSocket.cs" Link="RGUnityWebSocket.cs" />
     <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
     <Compile Include="..\RGWebSocketConfig.cs" Link="RGWebSocketConfig.cs" />
     <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
-    <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
   </ItemGroup>
 

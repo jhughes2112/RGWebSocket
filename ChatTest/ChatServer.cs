@@ -2,7 +2,9 @@
 // Reachable Games
 // Copyright 2026
 //-------------------
-// Chat-flavored IConnectionManager used by the stress test.
+// Chat-flavored connection manager used by the stress test.  This is the working example of RGConnectionManager's RAW
+// escape hatch: it uses the logger-only constructor and overrides OnRawMessage to speak its own text+binary protocol,
+// decoding UTF8 itself only when a frame actually is text.
 //
 // Protocol (text messages):
 //   client -> server:  "iam <guid>"             identify yourself, server replies "welcome"
@@ -25,11 +27,10 @@ namespace ReachableGames
 	{
 		namespace ChatTest
 		{
-			public class ChatConnectionManager : IConnectionManager
+			public class ChatConnectionManager : RGConnectionManager
 			{
 				private ConcurrentDictionary<RGWebSocket, Guid> _sockets = new ConcurrentDictionary<RGWebSocket, Guid>();  // every live socket, Guid.Empty until it identifies
 				private ConcurrentDictionary<Guid, RGWebSocket> _members = new ConcurrentDictionary<Guid, RGWebSocket>();  // only identified members
-				private ILogging _logger;
 
 				// Stats -- all bumped with Interlocked because callbacks arrive on per-socket recv threads.
 				private long _connections, _disconnections, _textMsgs, _binaryMsgs, _broadcasts, _whispers, _whisperMisses, _listRequests, _protocolErrors;
@@ -38,12 +39,24 @@ namespace ReachableGames
 				public long Connections      => Interlocked.Read(ref _connections);
 				public long Disconnections   => Interlocked.Read(ref _disconnections);
 
-				public ChatConnectionManager(ILogging logger)
+				public ChatConnectionManager(ILogging logger) : base(logger)  // raw mode: we override OnRawMessage below
 				{
-					_logger = logger;
 				}
 
-				public Task OnConnection(RGWebSocket rgws, HttpListenerContext context)
+				public override Task OnMessage(RGWebSocket rgws, IRGMessage msg)
+				{
+					return Task.CompletedTask;  // never called in raw mode
+				}
+
+				// Raw protocol dispatch: text is decoded here (only because this protocol actually wants strings), binary relays as-is.
+				protected override Task OnRawMessage(RGWebSocket rgws, PooledArray msg, bool isText)
+				{
+					if (isText)
+						return OnReceiveText(rgws, System.Text.Encoding.UTF8.GetString(msg.data, 0, msg.Length));
+					return OnReceiveBinary(rgws, msg);
+				}
+
+				public override Task OnConnection(RGWebSocket rgws, HttpListenerContext context)
 				{
 					_sockets.TryAdd(rgws, Guid.Empty);
 					Interlocked.Increment(ref _connections);
@@ -51,7 +64,7 @@ namespace ReachableGames
 					return Task.CompletedTask;
 				}
 
-				public Task OnDisconnect(RGWebSocket rgws)
+				public override Task OnDisconnect(RGWebSocket rgws)
 				{
 					if (_sockets.TryRemove(rgws, out Guid id) && id!=Guid.Empty)
 						_members.TryRemove(id, out _);
@@ -60,7 +73,7 @@ namespace ReachableGames
 					return Task.CompletedTask;
 				}
 
-				public Task OnReceiveText(RGWebSocket rgws, string msg)
+				private Task OnReceiveText(RGWebSocket rgws, string msg)
 				{
 					Interlocked.Increment(ref _textMsgs);
 					if (msg.StartsWith("iam ", StringComparison.Ordinal))
@@ -120,7 +133,7 @@ namespace ReachableGames
 
 				// Binary messages are relayed to everyone.  RGWebSocket.Send() bumps the refcount per recipient queue,
 				// and the recv thread's using-block drops the original reference after we return, so no extra IncRef is needed here.
-				public Task OnReceiveBinary(RGWebSocket rgws, PooledArray msg)
+				private Task OnReceiveBinary(RGWebSocket rgws, PooledArray msg)
 				{
 					Interlocked.Increment(ref _binaryMsgs);
 					foreach (var kvp in _members)
@@ -128,8 +141,8 @@ namespace ReachableGames
 					return Task.CompletedTask;
 				}
 
-				// Per the interface contract: close every socket, then wait for the disconnect callbacks to drain them out of our tracking.
-				public async Task Shutdown()
+				// Per the contract: close every socket, then wait for the disconnect callbacks to drain them out of our tracking.
+				public override async Task Shutdown()
 				{
 					foreach (var kvp in _sockets)
 						kvp.Key.Close();

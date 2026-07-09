@@ -20,7 +20,7 @@ namespace ReachableGames
 		// This enforces the everything-happens-on-main-thread requirement to work with Unity as a game platform.  This has been built in such a way to allow
 		// you to connect/close/connect multiple times without having to destroy it.  In many cases, you will want to reconnect on foregrounding and disconnection
 		// (probably) happens automatically on backgrounding, so important to make it easy.
-		public class UnityWebSocket
+		public class RGUnityWebSocket
 		{
 			// This tracks the status of RGWS, which is hard to determine directly from inspection due to async operations.
 			private enum Status
@@ -46,11 +46,12 @@ namespace ReachableGames
 			private volatile Status            _status = Status.ReadyToConnect;  // written on the socket's send thread (OnDisconnect), read on the main thread
 
 			private RGWebSocket?               _rgws;  // This should only be non-null when _status==Connected.
-			private RGWebSocketConfig          _config;
 			private ILogging                   _logger;
 			private string                     _loggerPrefix = "";
 			private string                     _lastErrorMsg = string.Empty;
-			private Action<UnityWebSocket>     _disconnectCallback;
+			private Action<RGUnityWebSocket>?  _disconnectCallback;
+			private readonly IMessageFactory?  _factory;  // null = raw mode (wsMessage API); non-null enables the typed Send/ReceiveAll
+			private List<wsMessage>            _typedScratch = new List<wsMessage>();  // scratch for the typed ReceiveAll; single consumer (main thread)
 
 			//-------------------
 			// Trivial accessors
@@ -78,16 +79,27 @@ namespace ReachableGames
 
 			//-------------------
 
-			public UnityWebSocket(ILogging logger, string loggerPrefix, Action<UnityWebSocket> disconnectCallback, int connectTimeoutMS, RGWebSocketConfig config)
+			// Raw mode: you speak your own protocol via Send(string)/Send(PooledArray) and ReceiveAll(List<wsMessage>).
+			// disconnectCallback may be null if you poll IsDisconnected instead.
+			public RGUnityWebSocket(ILogging logger, string loggerPrefix, Action<RGUnityWebSocket>? disconnectCallback, int connectTimeoutMS)
 			{
-				if (config==null)
-					throw new ArgumentNullException(nameof(config), "Pass RGWebSocketConfig.Default if you want the defaults.");
+				RGWebSocketConfig.MarkInUse();  // from here on, Configure() throws -- the pumps read the config unsynchronized
 				_logger = logger;
 				_loggerPrefix = loggerPrefix;
 				_disconnectCallback = disconnectCallback;
 				_connectTimeoutMS = connectTimeoutMS;
 				_connectUrl = string.Empty;
-				_config = config;
+				_factory = null;
+			}
+
+			// Typed mode (the normal case): Send(IRGMessage) and ReceiveAll(List<IRGMessage>) run everything through the
+			// factory's codec, and no pooled buffer ever reaches your code.
+			public RGUnityWebSocket(ILogging logger, string loggerPrefix, Action<RGUnityWebSocket>? disconnectCallback, int connectTimeoutMS, IMessageFactory factory)
+				: this(logger, loggerPrefix, disconnectCallback, connectTimeoutMS)
+			{
+				if (factory==null)
+					throw new ArgumentNullException(nameof(factory));
+				_factory = factory;
 			}
 
 			// Lets you specify where to connect to.
@@ -110,7 +122,7 @@ namespace ReachableGames
 			private async Task DoConnection()
 			{
 				if (_status!=Status.ReadyToConnect)
-					throw new InvalidOperationException("UnityWebSocket cannot Connect/Reconnect unless status is ReadyToConnect.  Call Shutdown() first.");
+					throw new InvalidOperationException("RGUnityWebSocket cannot Connect/Reconnect unless status is ReadyToConnect.  Call Shutdown() first.");
 				if (_rgws!=null)
 					Shutdown();  // the previous connection ended remotely and was never explicitly Shutdown; dispose it so Connect/Reconnect doesn't leak it
 
@@ -135,7 +147,7 @@ namespace ReachableGames
 						_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} http part");
 					}
 
-					_rgws = new RGWebSocket(null, OnReceive, OnDisconnect, _logger, uri.ToString(), wsClient, _config);
+					_rgws = new RGWebSocket(null, OnReceive, OnDisconnect, _logger, uri.ToString(), wsClient);
 					_status = Status.Connected;
 					_rgws.Start();  // pumps spin up only after everything is fully wired
 					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Connected to {uri} rgws part");
@@ -166,17 +178,26 @@ namespace ReachableGames
 				}
 			}
 
-			// A simple blocking way to make sure this is all torn down.
-			public void Shutdown()
+			// Tears everything down and resets so Connect/Reconnect is legal again.  This is the one to await from
+			// per-frame/game-loop code: the close handshake can take real time on a bad network, and awaiting it costs nothing.
+			public async Task ShutdownAsync()
 			{
 				if (_rgws!=null)
 				{
 					RGWebSocket rgws = _rgws;  // prevent recursion here in shutdown
 					_rgws = null;
-					rgws.Shutdown().Wait();
+					await rgws.Shutdown().ConfigureAwait(false);
 					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS connection reset.");
 				}
 				_status = Status.ReadyToConnect;
+			}
+
+			// Blocking convenience wrapper, fine for application teardown.  DO NOT call this from a game loop or UI thread --
+			// it synchronously waits out the close handshake, which is a frame hitch waiting for a bad network day.
+			// Use ShutdownAsync there instead.
+			public void Shutdown()
+			{
+				ShutdownAsync().GetAwaiter().GetResult();
 			}
 
 			// Returns false if data could not be sent (eg. you aren't connected or in a good status to do so)
@@ -221,6 +242,61 @@ namespace ReachableGames
 			{
 				// Take the whole set of incoming messages, lock it, then move it to messageList and clear it out
 				_incomingMessages.MoveTo(messageList);
+			}
+
+			//-------------------
+			// Typed API -- requires the IMessageFactory constructor.
+
+			// Serialize and queue a typed message.  Returns false if not connected.
+			public bool Send(IRGMessage msg)
+			{
+				if (_factory==null)
+					throw new InvalidOperationException("This RGUnityWebSocket was constructed in raw mode; use the IMessageFactory constructor for typed messages.");
+				if (_status!=Status.Connected)
+				{
+					_logger.Log(EVerbosity.Error, $"{_loggerPrefix} UWS Send called but status is {_status}");
+					return false;
+				}
+				using (PooledArray buffer = RGMessagePacker.Pack(_factory, msg))  // the send queue takes its own reference; ours releases here
+				{
+					return Send(buffer);
+				}
+			}
+
+			// Drain all pending inbound messages as typed objects (appends; caller clears).  Call from the main thread.
+			// There is NO disposal contract here -- nothing pooled survives deserialization.  Malformed frames are logged and
+			// skipped rather than disconnecting: the server is authoritative, and a malformed frame from your own server means
+			// a build mismatch, where the error log is the actionable part.
+			public void ReceiveAll(List<IRGMessage> messages)
+			{
+				if (_factory==null)
+					throw new InvalidOperationException("This RGUnityWebSocket was constructed in raw mode; use the IMessageFactory constructor for typed messages.");
+				_incomingMessages.MoveTo(_typedScratch);
+				for (int i=0; i<_typedScratch.Count; i++)
+				{
+					using (PooledArray pa = _typedScratch[i].msg)  // released no matter what happens below
+					{
+						if (_typedScratch[i].isText)
+						{
+							_logger.Log(EVerbosity.Error, $"{_loggerPrefix} typed ReceiveAll: text frame on a binary-only typed connection; skipped.");
+							continue;
+						}
+						if (pa.Length<4)
+						{
+							_logger.Log(EVerbosity.Error, $"{_loggerPrefix} typed ReceiveAll: runt frame ({pa.Length} bytes); skipped.");
+							continue;
+						}
+						int typeId = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(pa.data, 0, 4));
+						IRGMessage? typed = _factory.Deserialize(typeId, new ReadOnlySpan<byte>(pa.data, 4, pa.Length-4));
+						if (typed==null)
+						{
+							_logger.Log(EVerbosity.Error, $"{_loggerPrefix} typed ReceiveAll: factory rejected typeId={typeId} len={pa.Length-4}; skipped.");
+							continue;
+						}
+						messages.Add(typed);
+					}
+				}
+				_typedScratch.Clear();
 			}
 
 			//-------------------

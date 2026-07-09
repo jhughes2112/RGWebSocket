@@ -5,8 +5,10 @@
 // Copyright 2026
 //-------------------
 // Thin queue wrapper over System.Threading.Channels, shaped like the LockingList usage pattern (Add + MoveTo bulk drain)
-// so call sites stay familiar.  Benchmarked against LockingList+AsyncAutoResetEvent for the producer/consumer role:
-// 3-5x the throughput and ~zero steady-state allocations (see Benchmarks/SendQueueBenchmarks.cs for the receipt).
+// so call sites stay familiar.  Benchmarked (BenchmarkDotNet, .NET 10, i9-14900HX, 2026-07) against the previous
+// LockingList+Nito.AsyncAutoResetEvent implementation for this producer/consumer role: 3-5x the throughput and ~1KB vs
+// 1-2.8MB allocated per 100k messages (the async event allocated a waiter per sleep/wake cycle; the channel's waiter is
+// pooled and its queue segments ring-buffer-reuse when the consumer keeps up).
 // NOTE this is strictly FIFO -- it deliberately does NOT pretend to be a list (no Remove/PopBack/foreach).  LockingList
 // remains the right tool where those matter, e.g. the PooledArray free-lists that want LIFO for cache-warm reuse.
 

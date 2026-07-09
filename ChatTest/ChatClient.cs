@@ -3,7 +3,7 @@
 // Copyright 2026
 //-------------------
 // A standalone chat client for the stress test.  Instance as many of these as you like in one process.
-// Each client is built on UnityWebSocket (poll-style, like a game would use), identifies itself with a Guid,
+// Each client is built on RGUnityWebSocket (poll-style, like a game would use), identifies itself with a Guid,
 // then "plays around" for a few seconds: /list, broadcasts, whispers to random peers, and binary blobs.
 // At the end of a session it either closes gracefully, dies abruptly (no close handshake, simulating a crash),
 // or closes and reconnects for another session.
@@ -29,11 +29,10 @@ namespace ReachableGames
 				private readonly string        _url;
 				private readonly Random        _rng;
 				private readonly ILogging _logger;
-				private readonly RGWebSocketConfig _wsConfig;
 				private readonly int           _startDelayMs;
 				private readonly int           _playMs;
 
-				private UnityWebSocket _uws;
+				private RGUnityWebSocket _uws;
 				private List<Guid>     _peers = new List<Guid>();  // whoever the last /list response said is present (excluding us)
 				private int            _seq   = 0;                 // sequence number so every message is unique
 
@@ -45,12 +44,11 @@ namespace ReachableGames
 				public long   BinaryBytesReceived;
 				public string FatalError = null;
 
-				public ChatClient(string url, Random rng, ILogging logger, RGWebSocketConfig wsConfig, int startDelayMs, int playMs)
+				public ChatClient(string url, Random rng, ILogging logger, int startDelayMs, int playMs)
 				{
 					_url = url;
 					_rng = rng;
 					_logger = logger;
-					_wsConfig = wsConfig;
 					_startDelayMs = startDelayMs;
 					_playMs = playMs;
 					_shortId = Id.ToString().Substring(0, 8);
@@ -61,7 +59,7 @@ namespace ReachableGames
 					try
 					{
 						await Task.Delay(_startDelayMs).ConfigureAwait(false);
-						_uws = new UnityWebSocket(_logger, $"[client {_shortId}]", (uws) => Interlocked.Increment(ref DisconnectCallbacks), 5000, _wsConfig);
+						_uws = new RGUnityWebSocket(_logger, $"[client {_shortId}]", (uws) => Interlocked.Increment(ref DisconnectCallbacks), 5000);
 
 						int sessionCount = 1 + (_rng.NextDouble()<0.35 ? 1 : 0);  // 35% of clients reconnect for a second session
 						for (int s=0; s<sessionCount; s++)
@@ -86,7 +84,7 @@ namespace ReachableGames
 							_uws?.Shutdown();
 							if (_uws!=null)  // one final drain so any pooled binary buffers that arrived during teardown get released
 							{
-								List<UnityWebSocket.wsMessage> leftovers = new List<UnityWebSocket.wsMessage>();
+								List<RGUnityWebSocket.wsMessage> leftovers = new List<RGUnityWebSocket.wsMessage>();
 								Drain(leftovers);
 							}
 						}
@@ -117,7 +115,7 @@ namespace ReachableGames
 					ListsSent++;
 
 					// Play around for a few seconds: poll like a game loop, do random chat things.
-					List<UnityWebSocket.wsMessage> inbox = new List<UnityWebSocket.wsMessage>();
+					List<RGUnityWebSocket.wsMessage> inbox = new List<RGUnityWebSocket.wsMessage>();
 					long endAt = Environment.TickCount64 + _playMs;
 					while (Environment.TickCount64<endAt && _uws.IsConnected)
 					{
@@ -195,7 +193,7 @@ namespace ReachableGames
 				}
 
 				// Pull everything out of the socket's incoming queue and process it.  ALL messages are refcounted and MUST be disposed.
-				private void Drain(List<UnityWebSocket.wsMessage> inbox)
+				private void Drain(List<RGUnityWebSocket.wsMessage> inbox)
 				{
 					_uws.ReceiveAll(inbox);  // appends; we clear below
 					for (int i=0; i<inbox.Count; i++)

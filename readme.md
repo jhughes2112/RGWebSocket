@@ -56,12 +56,12 @@ using Logging;
 using ReachableGames.RGWebSocket;
 
 ILogging logger = new ConsoleLogger();
-Action<UnityWebSocket> disconnectCallback = (UnityWebSocket uws) => { Console.WriteLine("Disconnected"); };
+Action<RGUnityWebSocket> disconnectCallback = (RGUnityWebSocket uws) => { Console.WriteLine("Disconnected"); };
 int connectTimeoutMS = 3000;
 
-// Create a new WebSocket client instance.  RGWebSocketConfig carries all the tunable limits (buffer sizes,
-// inbound/outbound circuit breakers, idle disconnect); pass RGWebSocketConfig.Default if the defaults suit you.
-UnityWebSocket client = new UnityWebSocket(logger, "Client", disconnectCallback, connectTimeoutMS, RGWebSocketConfig.Default);
+// Create a new WebSocket client instance.  This is the raw-mode constructor; pass an IMessageFactory as the last
+// argument instead to get the typed Send(IRGMessage)/ReceiveAll(List<IRGMessage>) API (recommended, see below).
+RGUnityWebSocket client = new RGUnityWebSocket(logger, "Client", disconnectCallback, connectTimeoutMS);
 
 // Connect to the WebSocket server
 Dictionary<string, string> headers = new Dictionary<string, string>();
@@ -74,9 +74,9 @@ if (client.IsConnected)
 
 	// Receive any waiting messages, does not block.  You own every message you receive and must dispose
 	// each one to return its buffer to the pool.  isText tells you whether to read .Text or the raw bytes.
-	List<UnityWebSocket.wsMessage> inboundMessages = new List<UnityWebSocket.wsMessage>();
+	List<RGUnityWebSocket.wsMessage> inboundMessages = new List<RGUnityWebSocket.wsMessage>();
 	client.ReceiveAll(inboundMessages);
-	foreach (UnityWebSocket.wsMessage m in inboundMessages)
+	foreach (RGUnityWebSocket.wsMessage m in inboundMessages)
 	{
 		using (m.msg)  // returns the pooled buffer when done
 		{
@@ -98,7 +98,7 @@ if (client.IsConnected)
 
 ### WebSocket Server
 
-Creating a multi-threaded WebSocket server with RGWebSocket is just as simple.  Implement `IConnectionManager` to track your connections, then:
+Creating a multi-threaded WebSocket server with RGWebSocket is just as simple.  Derive from `RGConnectionManager` to track your connections, then:
 
 ```csharp
 using Logging;
@@ -110,14 +110,21 @@ int connectionTimeoutMS = 3000;
 int idleSeconds = 60;
 
 // Make the connection manager, which is told when a new websocket is connected and is also
-// responsible for closing them all if the server shuts down
-IConnectionManager connectionMgr = new YourConnectionManager();
+// responsible for closing them all if the server shuts down.  Derive from RGConnectionManager:
+// pass an IMessageFactory to its base constructor for typed messages (recommended), or use the
+// logger-only base constructor and override OnRawMessage to speak your own protocol.
+RGConnectionManager connectionMgr = new YourConnectionManager(new YourMessageFactory(), logger);
 
-// Create a new WebSocket server instance on a port.  RGWebSocketConfig carries all the tunable limits; a game
-// server probably wants the idle sweep on, so clients that vanish behind an Ingress get cleaned up:
-RGWebSocketConfig config = new RGWebSocketConfig() { IdleDisconnectSeconds = 300 };  // clients must heartbeat within 5 minutes
+// RGWebSocketConfig holds process-wide tunables (buffer sizes, inbound/outbound circuit breakers, idle sweep) as
+// getter-only statics.  Call Configure() ONCE before creating anything websocket-related (it validates and throws on
+// nonsense; it also throws if called after any socket/server exists), or skip it entirely to accept the defaults.
+// A game server probably wants the idle sweep on, so clients that vanish behind an Ingress get cleaned up -- clients
+// must then heartbeat more often than that interval (see the notes in RGWebSocketConfig.cs):
+RGWebSocketConfig.Configure(receiveBufferBytes: 4096, maxInboundMessageBytes: 16*1024*1024, maxUnsentBytes: 4*1024*1024, idleDisconnectSeconds: 300, idleSweepPeriodSeconds: 60);
+
+// Create a new WebSocket server instance on a port.
 IDataCollection? dataCollection = null;  // or pass your prometheus-backed IDataCollection derivative to have metrics pushed into it
-WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, config, dataCollection);
+WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, dataCollection);
 webServer.RegisterExactEndpoint("/status", async (context) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")));
 
 // Start listening.  This returns immediately; the listener runs on its own tasks.
@@ -126,19 +133,39 @@ webServer.Start();
 // Run until you hit the X key
 while (Console.ReadKey().KeyChar!='X') {}
 
-// Stop the web server, which tells the IConnectionManager to shutdown all the connections
+// Stop the web server, which tells the RGConnectionManager to shutdown all the connections
 await webServer.Shutdown().ConfigureAwait(false);
 ```
+
+## Typed messages (recommended)
+
+`RGConnectionManager` (server) and `RGUnityWebSocket` (client) deal in strongly typed message objects by default.
+Your messages implement `IRGMessage` (one property: an integer `TypeId` -- dispatch is a switch, never reflection, so
+IL2CPP/AOT is happy).  Your codec implements `IMessageFactory`, which owns BOTH `Serialize` and `Deserialize` -- the
+codec is a swappable strategy, so the same message classes can ride a sloppy JSON factory during development and a
+packed binary factory in production by changing one constructor argument.  See `ChatTest/TypedPhase.cs` for a complete
+working example of both codecs.
+
+All pooled-buffer accounting stays inside the library: `Deserialize` receives a `ReadOnlySpan<byte>`, so the compiler
+itself guarantees no reference to pooled memory can escape, and the typed `ReceiveAll` has no disposal contract at all.
+Deserialization runs on each socket's receive task, so parsing parallelizes across connections.  The typed pipeline is
+binary-only and strict: text frames, runt frames, unknown type ids, or payloads the factory rejects disconnect the peer
+with `EDisconnectReason.ProtocolError` (visible by cause in the metrics).  Wire format: `[int32 LE type id][payload]`.
+
+If you need text frames or your own framing, use the logger-only `RGConnectionManager` constructor and override
+`OnRawMessage(rgws, PooledArray, isText)` -- you own the protocol and the buffer rules apply (the library releases the
+buffer when you return; `IncRef` it if you keep it).  `ChatTest/ChatServer.cs` is a working raw-mode example.  On the
+client, `RGUnityWebSocket`'s config-only constructor is raw mode with the `wsMessage` API.
 
 ## Threading contract
 
 Knowing which thread runs your code is most of the battle with this kind of library, so here it is in one place:
 
 - `RGWebSocket.Send()` (both overloads) is safe to call from **any thread** at any time.  Messages are queued and a dedicated send task drains them in order.
-- `IConnectionManager.OnReceiveText`/`OnReceiveBinary` run on **that socket's receive task**.  One message at a time per socket, but different sockets call you **concurrently** -- anything they touch that is shared must be thread-safe.  Do not block in these callbacks (no sync waits on other locks, DBs, etc); you stall that socket's receive pump and, at scale, the thread pool.
-- `IConnectionManager.OnConnection` runs before the socket's pumps start -- nothing can arrive until you return.
-- `IConnectionManager.OnDisconnect` runs on **the dying socket's send task**.  Never call `RGWebSocket.Shutdown()` from there (it would wait for itself); `WebSocketServer` hands the socket to a reaper task that disposes it from outside.
-- `UnityWebSocket` queues everything; you drain with `ReceiveAll()` from **your main thread** whenever you like.  The `disconnectCallback` fires on the socket's send task -- set flags, don't touch your world state from it.
+- `RGConnectionManager.OnMessage` (and `OnRawMessage`, if you override it) runs on **that socket's receive task**.  One message at a time per socket, but different sockets call you **concurrently** -- anything they touch that is shared must be thread-safe.  Do not block in these callbacks (no sync waits on other locks, DBs, etc); you stall that socket's receive pump and, at scale, the thread pool.
+- `RGConnectionManager.OnConnection` runs before the socket's pumps start -- nothing can arrive until you return.
+- `RGConnectionManager.OnDisconnect` runs on **the dying socket's send task**.  Never call `RGWebSocket.Shutdown()` from there (it would wait for itself); `WebSocketServer` hands the socket to a reaper task that disposes it from outside.
+- `RGUnityWebSocket` queues everything; you drain with `ReceiveAll()` from **your main thread** whenever you like.  The `disconnectCallback` fires on the socket's send task -- set flags, don't touch your world state from it.
 - `WebServer` HTTP endpoint handlers run on thread pool tasks, one per request, bounded by the connection timeout.
 
 ## Disconnect causes and metrics
@@ -157,7 +184,7 @@ dotnet run --project ChatTest -- clients=48 seed=12345
 
 ## Documentation
 
-I wish there was more documentation for this library, but I haven't had time to write any yet.  It's still in development, although I suspect the rate of change is slowing.  The best guide for now is code in WebServer.cs and UnityWebSocket.cs and IConnectionManager.cs, the ChatTest example, or ask questions.
+I wish there was more documentation for this library, but I haven't had time to write any yet.  It's still in development, although I suspect the rate of change is slowing.  The best guide for now is code in WebServer.cs, RGConnectionManager.cs, and RGUnityWebSocket.cs, the ChatTest example, or ask questions.
 
 ## Contributing
 

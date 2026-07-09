@@ -15,20 +15,20 @@ namespace ReachableGames
 {
 	namespace RGWebSocket
 	{
-		// Use this to easily register endpoints for callbacks for normal HTTP requests, whereas all websocket upgrades will be handled by the IConnectionManager that is passed in.
-		public class WebServer
+		// Use this to easily register endpoints for callbacks for normal HTTP requests, whereas all websocket upgrades will be handled by the RGConnectionManager that is passed in.
+		public class RGWebServer
 		{
 			private readonly string              _url;
 			private readonly string              _urlPathPrefix;  // if this server is hosted at http://some.com/foo/bar, this is "/foo/bar/", for prefix-stripping request paths
 			private readonly ILogging            _logger;
-			private WebSocketServer              _httpServer;
+			private RGWebSocketServer            _httpServer;
 
 			public WebSocketServerMetrics        Metrics => _httpServer.Metrics;  // distribution-oriented server metrics, updated live
 
 			//-------------------
 
 			// dataCollection is nullable ON PURPOSE: pass your IDataCollection derivative to feed prometheus, or null explicitly.
-			public WebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, IConnectionManager connectionManager, ILogging logger, RGWebSocketConfig config, IDataCollection? dataCollection)
+			public RGWebServer(string url, int listenerThreads, int connectionTimeoutMS, int idleSeconds, RGConnectionManager connectionManager, ILogging logger, IDataCollection? dataCollection)
 			{
 				_url                 = url;
 				_logger              = logger;
@@ -39,7 +39,7 @@ namespace ReachableGames
 				if (_urlPathPrefix.EndsWith("/", StringComparison.Ordinal)==false)
 					_urlPathPrefix += "/";
 
-				_httpServer = new WebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger, config, dataCollection);
+				_httpServer = new RGWebSocketServer(listenerThreads, connectionTimeoutMS, idleSeconds, _url, HttpRequestHandler, connectionManager, _logger, dataCollection);
 			}
 
 			//-------------------

@@ -27,19 +27,20 @@
 
   <ItemGroup>
     <Compile Include="..\ChannelQueue.cs" Link="ChannelQueue.cs" />
-    <Compile Include="..\IConnectionManager.cs" Link="IConnectionManager.cs" />
     <Compile Include="..\IDataCollection.cs" Link="IDataCollection.cs" />
     <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
     <Compile Include="..\LockingList.cs" Link="LockingList.cs" />
     <Compile Include="..\Metrics.cs" Link="Metrics.cs" />
     <Compile Include="..\PooledArray.cs" Link="PooledArray.cs" />
+    <Compile Include="..\RGConnectionManager.cs" Link="RGConnectionManager.cs" />
+    <Compile Include="..\RGMessage.cs" Link="RGMessage.cs" />
+    <Compile Include="..\RGUnityWebSocket.cs" Link="RGUnityWebSocket.cs" />
     <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
     <Compile Include="..\RGWebSocketConfig.cs" Link="RGWebSocketConfig.cs" />
     <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
-    <Compile Include="..\UnityWebSocket.cs" Link="UnityWebSocket.cs" />
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
-    <Compile Include="..\WebServer.cs" Link="WebServer.cs" />
-    <Compile Include="..\WebSocketServer.cs" Link="WebSocketServer.cs" />
+    <Compile Include="..\RGWebServer.cs" Link="RGWebServer.cs" />
+    <Compile Include="..\RGWebSocketServer.cs" Link="RGWebSocketServer.cs" />
   </ItemGroup>
 
   <ItemGroup>

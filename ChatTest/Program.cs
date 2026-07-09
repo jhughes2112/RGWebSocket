@@ -84,18 +84,13 @@ namespace ReachableGames
 					PooledArray.Initialize(logger, 2000);  // warn if live buffer count runs away
 
 					//-------------------
-					// Server side.  The config deliberately tightens the library limits so the tests can trip them quickly:
+					// Server side.  Configure() deliberately tightens the library limits so the tests can trip them quickly:
 					// 1MB inbound cap (phase 3 sends 2MB), 3s idle disconnect with a 1s sweep (phase 4 lurker goes silent).
-					RGWebSocketConfig config = new RGWebSocketConfig()
-					{
-						MaxInboundMessageBytes = 1*1024*1024,
-						MaxUnsentBytes         = 4*1024*1024,
-						IdleDisconnectSeconds  = 3,
-						IdleSweepPeriodSeconds = 1,
-					};
+					// Must happen before anything websocket-related is constructed, or Configure() throws.
+					RGWebSocketConfig.Configure(receiveBufferBytes: 4096, maxInboundMessageBytes: 1*1024*1024, maxUnsentBytes: 4*1024*1024, idleDisconnectSeconds: 3, idleSweepPeriodSeconds: 1);
 					ChatConnectionManager mgr = new ChatConnectionManager(logger);
 					TestDataCollection dataCollection = new TestDataCollection();  // proves the IDataCollection conformance -- a real app would pass a prometheus-backed derivative
-					WebServer server = new WebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, logger, config, dataCollection);
+					RGWebServer server = new RGWebServer($"http://localhost:{port}/", 4, 5000, 30, mgr, logger, dataCollection);
 					server.RegisterExactEndpoint("/status", (ctx) => Task.FromResult((200, "text/plain", System.Text.Encoding.UTF8.GetBytes($"connections={mgr.CurrentCount}"))));
 					try
 					{
@@ -115,7 +110,7 @@ namespace ReachableGames
 					Random master = new Random(seed);
 					List<ChatClient> clientList = new List<ChatClient>();
 					for (int i=0; i<clients; i++)
-						clientList.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, RGWebSocketConfig.Default, startDelayMs: master.Next(0, 1500), playMs: playMs + master.Next(-1000, 1500)));
+						clientList.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, startDelayMs: master.Next(0, 1500), playMs: playMs + master.Next(-1000, 1500)));
 
 					Console.WriteLine($"Spawning {clients} clients...");
 					long startedAt = Environment.TickCount64;
@@ -156,14 +151,14 @@ namespace ReachableGames
 						await zombie.SendAsync(new ArraySegment<byte>(iam), WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
 						// ...and now the zombie never calls ReceiveAsync again.
 
-						UnityWebSocket flooder = new UnityWebSocket(logger, "[flooder]", null, 5000, RGWebSocketConfig.Default);
+						RGUnityWebSocket flooder = new RGUnityWebSocket(logger, "[flooder]", null, 5000);
 						await flooder.Connect($"ws://localhost:{port}/", new Dictionary<string, string>()).ConfigureAwait(false);
 						flooder.Send($"iam {Guid.NewGuid()}");
 						await Task.Delay(250).ConfigureAwait(false);  // let both register as members
 						membersAtFloodStart = mgr.CurrentCount;       // should be 2
 
 						long floodStart = Environment.TickCount64;
-						List<UnityWebSocket.wsMessage> floodInbox = new List<UnityWebSocket.wsMessage>();
+						List<RGUnityWebSocket.wsMessage> floodInbox = new List<RGUnityWebSocket.wsMessage>();
 						for (int i=0; i<100 && mgr.CurrentCount>1; i++)  // up to 100 x 512KB = 50MB before we give up
 						{
 							using (PooledArray blob = PooledArray.BorrowFromPool(512*1024))
@@ -172,7 +167,7 @@ namespace ReachableGames
 								flooder.Send(blob);
 							}
 							flooder.ReceiveAll(floodInbox);  // drain our own relayed copies so the FLOODER doesn't back up
-							foreach (UnityWebSocket.wsMessage m in floodInbox)
+							foreach (RGUnityWebSocket.wsMessage m in floodInbox)
 								using (m.msg) { }
 							floodInbox.Clear();
 							await Task.Delay(25).ConfigureAwait(false);
@@ -188,7 +183,7 @@ namespace ReachableGames
 						await Task.Delay(250).ConfigureAwait(false);
 						flooder.Shutdown();
 						flooder.ReceiveAll(floodInbox);  // release any relayed blobs that arrived during teardown
-						foreach (UnityWebSocket.wsMessage m in floodInbox)
+						foreach (RGUnityWebSocket.wsMessage m in floodInbox)
 							using (m.msg) { }
 						floodInbox.Clear();
 					}
@@ -285,7 +280,7 @@ namespace ReachableGames
 					List<ChatClient> lingerers = new List<ChatClient>();
 					List<Task> lingerTasks = new List<Task>();
 					for (int i=0; i<8; i++)
-						lingerers.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, RGWebSocketConfig.Default, startDelayMs: 0, playMs: 60000));  // would chat for 60s if the server let them
+						lingerers.Add(new ChatClient($"ws://localhost:{port}/", new Random(master.Next()), logger, startDelayMs: 0, playMs: 60000));  // would chat for 60s if the server let them
 					foreach (ChatClient c in lingerers)
 						lingerTasks.Add(Task.Run(c.Run));
 					await Task.Delay(2000).ConfigureAwait(false);  // let them all connect and get chatty
@@ -300,6 +295,16 @@ namespace ReachableGames
 					int afterShutdownCount = mgr.CurrentCount;
 					Console.WriteLine($"Phase 5: server shutdown took {shutdownMs}ms with {connectedBeforeShutdown} clients connected; clients {(lingerersHung ? "HUNG" : "all exited")}; server tracks {afterShutdownCount}.");
 					clientList.AddRange(lingerers);  // fold their stats into the aggregate below
+
+					//-------------------
+					// Phase 6: typed message layer.  The SAME message classes ride two swappable codecs (the point of
+					// IMessageFactory owning both directions), plus garbage input must yield a ProtocolError disconnect.
+					// Runs on port+1 with its own server, so it's independent of the (now stopped) main chat server.
+					Console.WriteLine();
+					Console.WriteLine("Phase 6: typed messages over two swappable codecs (packed binary + JSON)...");
+					(bool typedBinaryOk, long typedProtocolErrors, string typedBinDetail) = await TypedPhase.Run(port+1, new PackedBinaryFactory(), true, logger).ConfigureAwait(false);
+					(bool typedJsonOk, long ignoredPE, string typedJsonDetail) = await TypedPhase.Run(port+1, new JsonFactory(), false, logger).ConfigureAwait(false);
+					Console.WriteLine($"Phase 6: packedBinary {(typedBinaryOk ? "OK" : "FAILED")} ({typedBinDetail}); json {(typedJsonOk ? "OK" : "FAILED")} ({typedJsonDetail}); protocolErrors={typedProtocolErrors} (expected 1)");
 
 					await Task.Delay(250).ConfigureAwait(false);
 					GC.Collect();
@@ -379,6 +384,9 @@ namespace ReachableGames
 					if (server.Metrics.GetDisconnectCount(EDisconnectReason.OutboundBackpressure)!=1) failures.Add($"disconnect causes: expected exactly 1 OutboundBackpressure, saw {server.Metrics.GetDisconnectCount(EDisconnectReason.OutboundBackpressure)}");
 					if (server.Metrics.GetDisconnectCount(EDisconnectReason.InboundOversize)!=1)      failures.Add($"disconnect causes: expected exactly 1 InboundOversize, saw {server.Metrics.GetDisconnectCount(EDisconnectReason.InboundOversize)}");
 					if (server.Metrics.GetDisconnectCount(EDisconnectReason.IdleTimeout)!=1)          failures.Add($"disconnect causes: expected exactly 1 IdleTimeout, saw {server.Metrics.GetDisconnectCount(EDisconnectReason.IdleTimeout)}");
+					if (typedBinaryOk==false)                   failures.Add($"phase 6: typed layer failed with the packed binary codec ({typedBinDetail})");
+					if (typedJsonOk==false)                     failures.Add($"phase 6: typed layer failed with the JSON codec ({typedJsonDetail})");
+					if (typedProtocolErrors!=1)                 failures.Add($"phase 6: expected exactly 1 ProtocolError disconnect from the garbage client, saw {typedProtocolErrors}");
 					if (server.Metrics.HighWaterConnections<8)  failures.Add($"metrics: high water connections {server.Metrics.HighWaterConnections} is implausibly low");
 					if (server.Metrics.CurrentConnections!=0)   failures.Add($"metrics: current connections {server.Metrics.CurrentConnections} != 0 after shutdown");
 					// The IDataCollection sink must agree with the internal metrics -- this is the prometheus conformance check.
