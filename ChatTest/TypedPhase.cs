@@ -98,7 +98,7 @@ namespace ReachableGames
 			// wire format -- just typed objects in and out.
 			public class TypedEchoServer : RGConnectionManager
 			{
-				private ThreadSafeDictionary<RGWebSocket, RGWebSocket> _sockets = new ThreadSafeDictionary<RGWebSocket, RGWebSocket>();
+				private ThreadSafeHashSet<RGWebSocket> _sockets = new ThreadSafeHashSet<RGWebSocket>();
 				public int PingsSeen = 0;    // interlocked; OnMessage runs concurrently across sockets
 				public int ChatsSeen = 0;
 
@@ -106,7 +106,7 @@ namespace ReachableGames
 
 				public override Task OnConnection(RGWebSocket rgws, System.Net.HttpListenerContext context)
 				{
-					_sockets.Add(rgws, rgws);
+					_sockets.Add(rgws);
 					return Task.CompletedTask;
 				}
 
@@ -133,7 +133,7 @@ namespace ReachableGames
 
 				public override Task Shutdown()
 				{
-					_sockets.Foreach((rgws, unused) => rgws.Close());
+					_sockets.Foreach((rgws) => rgws.Close());
 					return Task.CompletedTask;
 				}
 			}

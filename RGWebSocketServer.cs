@@ -50,7 +50,7 @@ namespace ReachableGames
 			// Idle sweep: every live socket is tracked here from Start() to disconnection.  A periodic task disconnects any socket that
 			// hasn't RECEIVED data within config.IdleDisconnectSeconds, because transport idle timeouts can't be trusted behind an L7
 			// proxy/Ingress (the proxy keeps its upstream connection warm, so the listener never sees the idleness).
-			private ThreadSafeDictionary<RGWebSocket, RGWebSocket> _liveSockets = new ThreadSafeDictionary<RGWebSocket, RGWebSocket>();
+			private ThreadSafeHashSet<RGWebSocket> _liveSockets = new ThreadSafeHashSet<RGWebSocket>();
 			private Task                      _sweepTask = Task.CompletedTask;
 			private List<RGWebSocket>         _sweepWorking = new List<RGWebSocket>();  // only ever touched by the single sweep task
 
@@ -178,7 +178,7 @@ namespace ReachableGames
 					// All the unit conversion happens HERE, once per sweep pass -- the per-frame stamp in RGWebSocket is just a raw clock read.
 					long idleTimestampTicks = RGWebSocketConfig.IdleDisconnectSeconds * Stopwatch.Frequency;
 					long now = Stopwatch.GetTimestamp();  // monotonic, immune to the NTP clock corrections that are common in containers/VMs
-					_liveSockets.Foreach((rgws, unused) => { if (now - rgws.LastRecvTimestamp > idleTimestampTicks) _sweepWorking.Add(rgws); });  // collect under the read lock, act outside it
+					_liveSockets.Foreach((rgws) => { if (now - rgws.LastRecvTimestamp > idleTimestampTicks) _sweepWorking.Add(rgws); });  // collect under the read lock, act outside it
 					for (int i=0; i<_sweepWorking.Count; i++)
 					{
 						_logger.Log(EVerbosity.Warning, $"WebSocketServer.IdleSweep disconnecting {_sweepWorking[i].DisplayId} (nothing received for over {RGWebSocketConfig.IdleDisconnectSeconds}s)");
@@ -327,7 +327,7 @@ namespace ReachableGames
 							try
 							{
 								await _connectionManager.OnConnection(rgws, httpContext).ConfigureAwait(false);
-								_liveSockets.Add(rgws, rgws);  // tracked for the idle sweep; removed in OnDisconnection
+								_liveSockets.Add(rgws);  // tracked for the idle sweep; removed in OnDisconnection
 								Metrics.RecordConnect();
 								recordedConnect = true;
 								rgws.Start();

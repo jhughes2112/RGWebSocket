@@ -38,6 +38,7 @@
     <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
     <Compile Include="..\RGWebSocketConfig.cs" Link="RGWebSocketConfig.cs" />
     <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
+    <Compile Include="..\ThreadSafeHashSet.cs" Link="ThreadSafeHashSet.cs" />
     <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
     <Compile Include="..\RGWebServer.cs" Link="RGWebServer.cs" />
     <Compile Include="..\RGWebSocketServer.cs" Link="RGWebSocketServer.cs" />
