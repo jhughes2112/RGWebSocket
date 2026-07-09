@@ -1,0 +1,9 @@
+<Project>
+  <!-- ALL build artifacts live under the repo-root build\ folder; nothing pollutes the source tree.
+       Per-project subfolders are required because RGWebSocket.csproj and RGWebSocketUnity.csproj share
+       the repo root, and their NuGet restore artifacts (project.assets.json etc.) clobber each other otherwise. -->
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)build\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(MSBuildThisFileDirectory)build\bin\$(MSBuildProjectName)\</BaseOutputPath>
+  </PropertyGroup>
+</Project>

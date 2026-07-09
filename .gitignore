@@ -1,9 +1,5 @@
+build/
 **/obj/
-**/.vs/
 **/bin/
-**/Library/
-**/Temp/
-**/Build/
-**/Logs/
-**/publish/
+**/.vs/
 *.user

@@ -10,12 +10,14 @@
     <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
     <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 10, suitable for servers.</Description>
     <Nullable>disable</Nullable>
+    <!-- Both library csprojs live at the repo root, so default **/*.cs globbing must be off or they'd swallow ChatTest too. -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
-  <!-- Sources live in wholesale-copyable folders at the repo root; globs mean new files are picked up automatically. -->
+  <!-- Sources live in wholesale-copyable folders; globs mean new files are picked up automatically. -->
   <ItemGroup>
-    <Compile Include="..\RGWebSocket.Core\**\*.cs" LinkBase="Core" />
-    <Compile Include="..\RGWebSocket.Server\**\*.cs" LinkBase="Server" />
+    <Compile Include="RGWebSocket.Core\**\*.cs" LinkBase="Core" />
+    <Compile Include="RGWebSocket.Server\**\*.cs" LinkBase="Server" />
   </ItemGroup>
 
   <!-- No package dependencies: System.Threading.Channels is part of the .NET 10 shared framework. -->

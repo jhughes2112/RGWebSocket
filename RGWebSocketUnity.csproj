@@ -10,15 +10,22 @@
     <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
     <Description>A clean Unity-friendly package that provides a single-threaded simple interface to websockets, based on .NET Standard 2.1.</Description>
     <Nullable>disable</Nullable>
+    <!-- Both library csprojs live at the repo root, so default **/*.cs globbing must be off or they'd swallow ChatTest too. -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
   <!-- Unity target compiles ONLY the Core folder — the same folder you would copy into a Unity project. -->
   <ItemGroup>
-    <Compile Include="..\RGWebSocket.Core\**\*.cs" LinkBase="Core" />
+    <Compile Include="RGWebSocket.Core\**\*.cs" LinkBase="Core" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
   </ItemGroup>
+
+  <!-- Copy the Channels DLL into the output so build\ contains everything a Unity project needs in Assets\Plugins. -->
+  <PropertyGroup>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
 
 </Project>
