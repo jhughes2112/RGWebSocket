@@ -9,44 +9,13 @@
     <Company>Reachable Games LLC</Company>
     <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
     <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 10, suitable for servers.</Description>
-    <ApplicationIcon>reachablegames.ico</ApplicationIcon>
-    <SignAssembly>true</SignAssembly>
-    <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
-    <DelaySign>false</DelaySign>
     <Nullable>disable</Nullable>
   </PropertyGroup>
 
-  <PropertyGroup>
-    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <PackageIcon>reachablegames.png</PackageIcon>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageReadmeFile>readme.md</PackageReadmeFile>
-    <IncludeSymbols>true</IncludeSymbols>
-    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-  </PropertyGroup>
-
+  <!-- Sources live in wholesale-copyable folders at the repo root; globs mean new files are picked up automatically. -->
   <ItemGroup>
-    <Compile Include="..\ChannelQueue.cs" Link="ChannelQueue.cs" />
-    <Compile Include="..\IDataCollection.cs" Link="IDataCollection.cs" />
-    <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
-    <Compile Include="..\LockingList.cs" Link="LockingList.cs" />
-    <Compile Include="..\Metrics.cs" Link="Metrics.cs" />
-    <Compile Include="..\PooledArray.cs" Link="PooledArray.cs" />
-    <Compile Include="..\RGConnectionManager.cs" Link="RGConnectionManager.cs" />
-    <Compile Include="..\RGMessage.cs" Link="RGMessage.cs" />
-    <Compile Include="..\RGUnityWebSocket.cs" Link="RGUnityWebSocket.cs" />
-    <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
-    <Compile Include="..\RGWebSocketConfig.cs" Link="RGWebSocketConfig.cs" />
-    <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
-    <Compile Include="..\ThreadSafeHashSet.cs" Link="ThreadSafeHashSet.cs" />
-    <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
-    <Compile Include="..\RGWebServer.cs" Link="RGWebServer.cs" />
-    <Compile Include="..\RGWebSocketServer.cs" Link="RGWebSocketServer.cs" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Include="..\readme.md" Pack="true" PackagePath="\" />
-    <None Include="reachablegames.png" Pack="true" PackagePath="" />
+    <Compile Include="..\RGWebSocket.Core\**\*.cs" LinkBase="Core" />
+    <Compile Include="..\RGWebSocket.Server\**\*.cs" LinkBase="Server" />
   </ItemGroup>
 
   <!-- No package dependencies: System.Threading.Channels is part of the .NET 10 shared framework. -->

@@ -15,20 +15,22 @@ RGWebSocket is a similarly powerful and user-friendly C# library for building hi
 
 ## Installation
 
-You can install RGWebSocket via NuGet Package Manager or by downloading the source code from GitHub.
+RGWebSocket is distributed as source.  The sources live in exactly two folders, designed to be copied wholesale into other projects:
 
-### NuGet Package Manager
+| Folder | What it is | Who copies it |
+|---|---|---|
+| `RGWebSocket.Core/` | Client + shared code (netstandard2.1-safe, works in Unity) | **Everyone.** Every consuming project gets this folder. |
+| `RGWebSocket.Server/` | Server-side code: RGWebSocketServer, RGWebServer, RGConnectionManager, metrics (.NET 10) | Server projects only, in addition to Core. |
 
-To install RGWebSocket using NuGet, run the following command in the Package Manager Console:
+That's the whole rule: **clients copy Core; servers copy Core and Server.**  Everything else in the repo (`RGWebSocket/`, `RGWebSocketUnity/`, `ChatTest/`, the batch files) is build/test scaffolding and never gets copied anywhere.
 
-```bash
-Install-Package RGWebSocket
-```
+### Unity
 
-### Manual Installation from GitHub
+Copy `RGWebSocket.Core/` into your `Assets/` folder.  Unity's BCL does not include `System.Threading.Channels`, so you also need that DLL (and it alone) in your `Assets/Plugins/` folder — running `build.bat` deposits a copy in `publish/unity/`, or grab it from the NuGet package of the same name.
 
-1. Clone the RGWebSocket repository from GitHub.
-2. Include the necessary RGWebSocket files in your C# or Unity project.
+### .NET servers and clients
+
+Copy `RGWebSocket.Core/` (and `RGWebSocket.Server/` for servers) into your project tree — the SDK-style `**/*.cs` glob picks them up automatically.  Alternatively, `build.bat` produces ready-made DLLs: `publish/net10/RGWebSocket.dll` (Core+Server) and `publish/unity/RGWebSocketUnity.dll` (Core only, netstandard2.1).
 
 ## Usage
 

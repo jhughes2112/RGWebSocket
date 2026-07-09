@@ -9,40 +9,12 @@
     <Company>Reachable Games LLC</Company>
     <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
     <Description>A clean Unity-friendly package that provides a single-threaded simple interface to websockets, based on .NET Standard 2.1.</Description>
-    <ApplicationIcon>reachablegames.ico</ApplicationIcon>
-    <SignAssembly>true</SignAssembly>
-    <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
-    <DelaySign>false</DelaySign>
     <Nullable>disable</Nullable>
   </PropertyGroup>
 
-  <PropertyGroup>
-    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <PackageIcon>reachablegames.png</PackageIcon>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageReadmeFile>readme.md</PackageReadmeFile>
-    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
-    <IncludeSymbols>true</IncludeSymbols>
-    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-  </PropertyGroup>
-
+  <!-- Unity target compiles ONLY the Core folder — the same folder you would copy into a Unity project. -->
   <ItemGroup>
-    <Compile Include="..\ChannelQueue.cs" Link="ChannelQueue.cs" />
-    <Compile Include="..\ILogging.cs" Link="ILogging.cs" />
-    <Compile Include="..\LockingList.cs" Link="LockingList.cs" />
-    <Compile Include="..\PooledArray.cs" Link="PooledArray.cs" />
-    <Compile Include="..\RGMessage.cs" Link="RGMessage.cs" />
-    <Compile Include="..\RGUnityWebSocket.cs" Link="RGUnityWebSocket.cs" />
-    <Compile Include="..\RGWebSocket.cs" Link="RGWebSocket.cs" />
-    <Compile Include="..\RGWebSocketConfig.cs" Link="RGWebSocketConfig.cs" />
-    <Compile Include="..\ThreadSafeDictionary.cs" Link="ThreadSafeDictionary.cs" />
-    <Compile Include="..\ThreadSafeHashSet.cs" Link="ThreadSafeHashSet.cs" />
-    <Compile Include="..\Utilities.cs" Link="Utilities.cs" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <None Include="..\readme.md" Pack="true" PackagePath="\" />
-    <None Include="reachablegames.png" Pack="true" PackagePath="" />
+    <Compile Include="..\RGWebSocket.Core\**\*.cs" LinkBase="Core" />
   </ItemGroup>
 
   <ItemGroup>
