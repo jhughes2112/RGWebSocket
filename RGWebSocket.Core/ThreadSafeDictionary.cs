@@ -111,6 +111,25 @@ namespace Shared
 			}
 		}
 
+		// Remove an item only if the predicate still holds, checked under the write lock.  Avoids deleting an entry
+		// another thread updated between your read and the removal.
+		public bool RemoveIf(TKey key, Func<TValue, bool> predicate)
+		{
+			_lock.EnterWriteLock();
+			try
+			{
+				if (_dictionary.TryGetValue(key, out TValue? value) && predicate(value))
+				{
+					return _dictionary.Remove(key);
+				}
+				return false;
+			}
+			finally
+			{
+				_lock.ExitWriteLock();
+			}
+		}
+
 		// Remove an item from the dictionary, returning the value that was removed
 		public bool TryRemove(TKey key, [MaybeNullWhen(false)] out TValue value)
 		{
