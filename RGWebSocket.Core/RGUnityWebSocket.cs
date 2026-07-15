@@ -171,9 +171,10 @@ namespace ReachableGames
 			// This is a friendly close, where we tell the other side and they shake on it.
 			public void Close()
 			{
-				if (_status==Status.Connected)
+				RGWebSocket? rgws = _rgws;  // snapshot: Shutdown() on another thread nulls the field before _status changes
+				if (_status==Status.Connected && rgws!=null)
 				{
-					_rgws!.Close();
+					rgws.Close();
 					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Closed.");
 				}
 			}
@@ -203,9 +204,10 @@ namespace ReachableGames
 			// Returns false if data could not be sent (eg. you aren't connected or in a good status to do so)
 			public bool Send(string msg)
 			{
-				if (_status == Status.Connected)
+				RGWebSocket? rgws = _rgws;  // snapshot: Shutdown() on another thread nulls the field before _status changes
+				if (_status == Status.Connected && rgws!=null)
 				{
-					_rgws!.Send(msg);
+					rgws.Send(msg);
 #if RGWS_LOGGING
 					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Sent {msg.Length} bytes");
 #endif
@@ -221,9 +223,10 @@ namespace ReachableGames
 			// Returns false if data could not be sent (eg. you aren't connected or in a good status to do so)
 			public bool Send(PooledArray msg)
 			{
-				if (_status == Status.Connected)
+				RGWebSocket? rgws = _rgws;  // snapshot: Shutdown() on another thread nulls the field before _status changes
+				if (_status == Status.Connected && rgws!=null)
 				{
-					_rgws!.Send(msg);
+					rgws.Send(msg);
 #if RGWS_LOGGING
 					_logger.Log(EVerbosity.Debug, $"{_loggerPrefix} UWS Sent {msg.Length} bytes");
 #endif

@@ -39,6 +39,7 @@ namespace ReachableGames
 
 			private Task                      _listenerUpdateTask = Task.CompletedTask;  // sleeps until one of the listeners finishes its work, then it creates a new one.  When _isRunning goes false, this exits.
 			private HttpListener              _listener = new HttpListener();  // this is the listener but ALSO manages some internal structure for all WebSocket objects.  When you call .Close() on this, the listener stops but websockets do not abort.
+			private volatile bool             _draining = false;  // set by StopListening: refuse new websocket upgrades while existing connections drain, so none is left mid-I/O when the listener stops
 
 			// Dead websockets are handed to the reaper task for final Shutdown(), because RGWebSocket's onDisconnection callback runs
 			// ON the socket's own send task -- awaiting Shutdown() there would be waiting for yourself to finish.  The reaper does it from outside.
@@ -91,6 +92,7 @@ namespace ReachableGames
 				// Kick off the listener update task.  It makes sure there are always _maxCount listener threads available to accept incoming connections.
 				try
 				{
+					_draining = false;  // fresh start (supports Stop/Start reuse)
 					_listener.Prefixes.Clear();
 					_listener.Prefixes.Add(_prefixURL);
 					_listener.TimeoutManager.IdleConnection = TimeSpan.FromSeconds(_idleSeconds);  // idle connections are cut after this long -- note, this doesn't affect websockets at all.
@@ -109,17 +111,32 @@ namespace ReachableGames
 				}
 			}
 
-			// Blocks until the listener task is torn down.  Drains out the connection manager, then aborts any remaining connections.
+			// Blocks until the listener task is torn down.  Drains out the connection manager, then stops the listener.
+			//
+			// ORDERING IS LOAD-BEARING.  Every accepted HttpListenerWebSocket allocates its send/receive overlappeds from
+			// the HttpListener's ThreadPoolBoundHandle -- a SINGLE handle shared by all connections on this listener.  Both
+			// _listener.Stop() AND _listener.Close() dispose that handle, so ANY websocket still doing I/O when the listener
+			// stops touches a freed handle.  When that access lands on the send task it is a caught ObjectDisposedException
+			// on ThreadPoolBoundHandle; when it lands on the receive IOCP completion (ThreadPoolBoundHandle.OnNativeIOCompleted)
+			// it is an UNHANDLED 'overlapped has already been freed' that crashes the whole process.  Same root cause, two
+			// landing spots.  Therefore we must fully DRAIN and REAP every connection while the listener (and its handle) is
+			// still completely live, and only THEN stop it.  New upgrades are refused during the drain (_draining) so the
+			// set we wait on cannot grow.  A surgical repro that streams traffic then tears the listener down hit the
+			// disposed-handle exception on ~12% of teardowns with the old ordering; drain-first takes it to zero.
 			public async Task StopListening()
 			{
-				if (_listener.IsListening)
+				if (_listener.IsListening && _draining==false)
 				{
-					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening Listener.Close");
-					_listener.Stop();  // cancel everything
+					_draining = true;  // HandleConnection now refuses new websocket upgrades; existing ones are unaffected
+
+					// 1) Close and fully reap every LIVE connection while the listener's shared handle is still valid, so
+					//    graceful close frames and any in-flight receives complete against a live handle, not a freed one.
 					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening ConnectionManager.Shutdown");
-					await _listenerUpdateTask.ConfigureAwait(false);  // wait until all the listener tasks have exited
-					_listener.Close();  // dispose the listener
-					await _connectionManager.Shutdown().ConfigureAwait(false);  // disconnect all existing RGWS connections
+					await _connectionManager.Shutdown().ConfigureAwait(false);  // app cleanup + closes the sockets IT tracks
+					// Belt and suspenders: close any accepted socket the app did NOT track (e.g. connected but not yet in a
+					// lobby).  EVERY accepted socket must be reaped before the handle is disposed, or its posted receive is
+					// the one that fires OnNativeIOCompleted on a freed overlapped.  Close() is idempotent per socket.
+					_liveSockets.Foreach((rgws) => rgws.Close(EDisconnectReason.LocalShutdown));
 
 					// Every disconnect lands in the reaper queue; wait until the reaper has disposed them all, so shutdown is deterministic.
 					long deadline = Environment.TickCount64 + 5000;
@@ -127,6 +144,14 @@ namespace ReachableGames
 						await Task.Delay(20).ConfigureAwait(false);
 					if (Volatile.Read(ref _pendingReaps)>0)
 						_logger.Log(EVerbosity.Warning, $"WebSocketServer.StopListening: {_pendingReaps} sockets still unreaped after 5s");
+
+					// 2) No websocket holds an overlapped against the handle anymore -- now it is safe to stop and dispose the listener.
+					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening Listener.Stop");
+					_listener.Stop();  // aborts only the pending GetContextAsync accepts, which have no websockets behind them
+					await _listenerUpdateTask.ConfigureAwait(false);  // wait until all the listener accept tasks have exited
+					_listener.Close();  // dispose the listener and its now-unused ThreadPoolBoundHandle
+
+					// 3) Stop the reaper and idle sweep (they shared a lifecycle with the listener).
 					if (_reaperCancel!=null)
 					{
 						_reaperCancel.Cancel();
@@ -232,6 +257,11 @@ namespace ReachableGames
 
 					while (_listener.IsListening)  // loop forever until canceled
 					{
+						// Shutdown race: Stop() faults the pending GetContextAsync tasks BEFORE IsListening reads false, so the
+						// set can drain to empty while the loop condition still passes -- and WhenAny(empty) throws.  Drained
+						// means shutdown is already underway; just exit.
+						if (listenerTasks.Count==0)
+							break;
 						using (Task t = await Task.WhenAny(listenerTasks).ConfigureAwait(false))
 						{
 							listenerTasks.Remove(t);
@@ -305,6 +335,14 @@ namespace ReachableGames
 			// Task: when a connection is requested, depending on whether it's an HTTP request or WebSocket request, do different things.
 			private async Task HandleConnection(HttpListenerContext httpContext)
 			{
+				// Shutdown in progress: refuse new websocket upgrades so the drain in StopListening cannot race a socket
+				// that starts its receive pump (and posts an overlapped against the handle) after the drain has passed.
+				if (_draining && httpContext.Request.IsWebSocketRequest)
+				{
+					try { httpContext.Response.StatusCode = 503; httpContext.Response.Close(); } catch (Exception) { }
+					return;
+				}
+
 				// Allow debugging to actually happen, where you have unlimited time to check things without breaking a connection.  -1 means don't cancel over time.
 				int timeoutMS = Debugger.IsAttached ? -1 : _connectionMS;
 				if (httpContext.Request.IsWebSocketRequest)

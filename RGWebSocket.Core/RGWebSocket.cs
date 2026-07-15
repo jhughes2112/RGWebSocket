@@ -87,6 +87,29 @@ namespace ReachableGames
 				_logger.Log(EVerbosity.Error, LastError);
 			}
 
+			// A send/close that throws because the transport is already gone is the NORMAL end of a connection, not a
+			// fault: the disconnect reason is stamped separately, and these types all mean "the socket/handle went away
+			// mid-operation."  Most common is closing a socket whose peer already closed (CloseOutputAsync races the
+			// remote close), or the server's listener disposing its shared IOCP handle during shutdown (ObjectDisposedException
+			// on ThreadPoolBoundHandle).  None of it is actionable, so it is recorded on LastError but logged quietly --
+			// only genuinely unexpected exception types keep the loud Error+stack.  (The Recv task already does this via its
+			// dedicated catch (WebSocketException); this is the Send task's equivalent.)
+			private static bool IsExpectedTransportTeardown(Exception e)
+			{
+				return e is ObjectDisposedException
+					|| e is System.Net.WebSockets.WebSocketException
+					|| e is System.IO.IOException
+					|| e is System.Net.HttpListenerException
+					|| e is System.Net.Sockets.SocketException;
+			}
+
+			// Record a benign transport-teardown on LastError without the loud Error+stack (it is expected during close/shutdown).
+			private void NoteQuietDisconnect(string detail)
+			{
+				LastError = detail;
+				_logger.Log(EVerbosity.Debug, detail);
+			}
+
 			// when we want to close, we push this through Send() so it knows to initiate closure.  Can be static because it's a sentinel, and compared by address.
 			// This has a public accessor so it can be ignored when debugging memory leaks, since it's an object that appears leaked but isn't.
 			static public PooledArray sCloseOutputAsync { get; private set; } = PooledArray.BorrowFromPool(1);
@@ -480,7 +503,10 @@ namespace ReachableGames
 									{
 										StampDisconnectReason(EDisconnectReason.TransportError);
 										_cancellationTokenSource!.Cancel();  // exits this task and kills the Recv task
-										SetLastError($"Exception caught waiting on _outgoing RGWSID={DisplayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
+										if (IsExpectedTransportTeardown(ex))
+											NoteQuietDisconnect($"RGWSID={DisplayId} Send closed on teardown: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex.GetType().Name}: {ex.Message}");
+										else
+											SetLastError($"Exception caught waiting on _outgoing RGWSID={DisplayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {ex}");
 									}
 									break;
 								}
@@ -508,7 +534,12 @@ namespace ReachableGames
 											if (qsm.binMsg.Equals(sCloseOutputAsync))  // we want to close
 											{
 												StampDisconnectReason(EDisconnectReason.LocalClose);  // no-op if a policy reason (idle sweep, etc) was stamped by Close(reason)
-												await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Locally initiated close", token).ConfigureAwait(false);
+												// Only send a close frame if the state still permits it.  CloseOutputAsync is only valid from Open
+												// or CloseReceived; from any other state (the peer already closed/reset, or the transport is gone) it
+												// just throws -- so skip it and let teardown finish.  This AVOIDS the most common benign teardown-race
+												// exception instead of merely swallowing it; genuine races that slip through are handled by the catch.
+												if (_webSocket.State==WebSocketState.Open || _webSocket.State==WebSocketState.CloseReceived)
+													await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Locally initiated close", token).ConfigureAwait(false);
 												// no self-nudge needed here: the loop only parks when the queue is empty AND the state is Open, and the state is CloseSent now
 
 												// empty/burn the remaining messages, since we're closed now
@@ -541,7 +572,13 @@ namespace ReachableGames
 								{
 									StampDisconnectReason(EDisconnectReason.TransportError);
 									_cancellationTokenSource!.Cancel();  // exits this task and kills the Recv task
-									SetLastError($"Exception caught in Open RGWSID={DisplayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {e}");
+									// CloseOutputAsync/SendAsync throwing because the peer or the listener's shared handle already
+									// went away is the expected end of a connection, not a fault -- log it quietly.  Only a truly
+									// unexpected exception type gets the loud Error+stack.
+									if (IsExpectedTransportTeardown(e))
+										NoteQuietDisconnect($"RGWSID={DisplayId} Send closed on teardown: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {e.GetType().Name}: {e.Message}");
+									else
+										SetLastError($"Exception caught in Open RGWSID={DisplayId} Send: [{Enum.GetName(typeof(WebSocketState), _webSocket.State)}] {e}");
 								}
 								break;
 							}
