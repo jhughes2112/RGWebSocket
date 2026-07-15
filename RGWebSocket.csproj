@@ -10,6 +10,9 @@
     <Copyright>Copyright 2026 Reachable Games LLC</Copyright>
     <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET 10, suitable for servers.</Description>
     <Nullable>disable</Nullable>
+    <!-- This DLL is meant to be dropped into NativeAOT server projects. Turn on the trim/AOT analyzers
+         so any AOT-unsafe pattern is flagged here, at library build time, not at the consumer's publish. -->
+    <IsAotCompatible>true</IsAotCompatible>
     <!-- Both library csprojs live at the repo root, so default **/*.cs globbing must be off or they'd swallow ChatTest too. -->
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>

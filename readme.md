@@ -15,22 +15,35 @@ RGWebSocket is a similarly powerful and user-friendly C# library for building hi
 
 ## Installation
 
-RGWebSocket is distributed as source.  The sources live in exactly two folders, designed to be copied wholesale into other projects:
+There are two ways to consume RGWebSocket, and they build from the same two source folders:
 
-| Folder | What it is | Who copies it |
+| Folder | What it is | Ends up in |
 |---|---|---|
-| `RGWebSocket.Core/` | Client + shared code (netstandard2.1-safe, works in Unity) | **Everyone.** Every consuming project gets this folder. |
+| `RGWebSocket.Core/` | Client + shared code (netstandard2.1-safe, works in Unity) | **Every** consuming project — client or server. |
 | `RGWebSocket.Server/` | Server-side code: RGWebSocketServer, RGWebServer, RGConnectionManager, metrics (.NET 10) | Server projects only, in addition to Core. |
 
-That's the whole rule: **clients copy Core; servers copy Core and Server.**  Everything else in the repo (the root csproj/sln files, `ChatTest/`, the batch files) is build/test scaffolding and never gets copied anywhere.
+Everything else in the repo (the root csproj/sln files, `ChatTest/`, the batch files) is build/test scaffolding and is never consumed anywhere.
 
-### Unity
+### Option A: prebuilt DLL + PDB drop-in (recommended)
 
-Copy `RGWebSocket.Core/` into your `Assets/` folder.  Unity's BCL does not include `System.Threading.Channels`, so you also need that DLL (and it alone) in your `Assets/Plugins/` folder — running `build.bat` deposits a copy in `build/`, or grab it from the NuGet package of the same name.
+Run `build.bat`.  It produces two **standalone, self-contained** folders under `build/` — copy one folder wholesale into your project:
 
-### .NET servers and clients
+| Folder | Contents | Drop into |
+|---|---|---|
+| `build/Server/` | `RGWebSocket.dll` + `RGWebSocket.pdb` (Core **and** Server, .NET 10) | A .NET server project — reference the DLL directly. |
+| `build/Client/` | `RGWebSocketUnity.dll` + `RGWebSocketUnity.pdb` + `System.Threading.Channels.dll` (Core only, netstandard2.1) | Unity `Assets/Plugins/`. |
 
-Copy `RGWebSocket.Core/` (and `RGWebSocket.Server/` for servers) into your project tree — the SDK-style `**/*.cs` glob picks them up automatically.  Alternatively, `build.bat` produces ready-made DLLs flat in `build/`: `RGWebSocket.dll` (Core+Server, .NET 10) and `RGWebSocketUnity.dll` (Core only, netstandard2.1).
+Pick exactly one: **clients take the Client folder, servers take the Server folder.**  There is no NuGet feed and no cross-package dependency to manage — each folder is everything that package needs.
+
+Every DLL ships with a **portable PDB that has the full library source embedded**, so you can step straight into RGWebSocket's code from your project with nothing but the `.dll` + `.pdb` present — no source tree, no SourceLink, no symbol server.  (To actually step in, build your project in Debug or turn off "Just My Code" in the debugger, since the DLL itself is an optimized Release build.)
+
+The server DLL is built with `IsAotCompatible=true`, so it is verified trim/NativeAOT-clean at library build time and is safe to reference from a NativeAOT server project.
+
+Unity's BCL does not include `System.Threading.Channels`, which is why the Client folder ships that DLL alongside — drop all three files into `Assets/Plugins/` and you are done.  No NuGet involvement.
+
+### Option B: copy the source folders
+
+Prefer to compile the library as part of your own assembly?  Copy `RGWebSocket.Core/` (and `RGWebSocket.Server/` for servers) into your project tree — the SDK-style `**/*.cs` glob picks them up automatically.  For Unity, copy `RGWebSocket.Core/` into `Assets/` and add `System.Threading.Channels.dll` (from `build/Client/`, or the NuGet package of the same name) to `Assets/Plugins/`.
 
 ## Usage
 

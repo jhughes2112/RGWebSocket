@@ -6,4 +6,14 @@
     <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)build\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
     <BaseOutputPath>$(MSBuildThisFileDirectory)build\bin\$(MSBuildProjectName)\</BaseOutputPath>
   </PropertyGroup>
+
+  <!-- Ship a portable PDB with the full source embedded, even in Release. This lets any consuming
+       project (server or Unity) step into the library source with just the .dll + .pdb dropped in -
+       no source tree, no SourceLink, no symbol server required. -->
+  <PropertyGroup>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <EmbedAllSources>true</EmbedAllSources>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
 </Project>
