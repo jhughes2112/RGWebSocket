@@ -138,18 +138,32 @@ namespace ReachableGames
 					// the one that fires OnNativeIOCompleted on a freed overlapped.  Close() is idempotent per socket.
 					_liveSockets.Foreach((rgws) => rgws.Close(EDisconnectReason.LocalShutdown));
 
-					// Every disconnect lands in the reaper queue; wait until the reaper has disposed them all, so shutdown is deterministic.
-					long deadline = Environment.TickCount64 + 5000;
-					while (Volatile.Read(ref _pendingReaps)>0 && Environment.TickCount64<deadline)
+					// Wait for every socket to finish DISCONNECTING and be reaped.  Both conditions are load-bearing:
+					// _pendingReaps only increments when a socket REACHES disconnection, so right after Close() it can
+					// still be zero while every socket is mid-teardown with receives posted -- waiting on it alone fell
+					// straight through to disposing the shared handle (the exact crash described above).  A socket is
+					// always visible in _liveSockets OR _pendingReaps (OnDisconnection increments the reap count BEFORE
+					// leaving the live set), so the combined condition has no slip window.
+					long deadline = Environment.TickCount64 + 30000;
+					while ((_liveSockets.Count>0 || Volatile.Read(ref _pendingReaps)>0) && Environment.TickCount64<deadline)
 						await Task.Delay(20).ConfigureAwait(false);
-					if (Volatile.Read(ref _pendingReaps)>0)
-						_logger.Log(EVerbosity.Warning, $"WebSocketServer.StopListening: {_pendingReaps} sockets still unreaped after 5s");
 
-					// 2) No websocket holds an overlapped against the handle anymore -- now it is safe to stop and dispose the listener.
-					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening Listener.Stop");
-					_listener.Stop();  // aborts only the pending GetContextAsync accepts, which have no websockets behind them
-					await _listenerUpdateTask.ConfigureAwait(false);  // wait until all the listener accept tasks have exited
-					_listener.Close();  // dispose the listener and its now-unused ThreadPoolBoundHandle
+					if (_liveSockets.Count>0 || Volatile.Read(ref _pendingReaps)>0)
+					{
+						// The invariant cannot be met: disposing the listener now would free the ThreadPoolBoundHandle
+						// under live receive I/O -- a NATIVE crash, not an exception.  Leak the listener instead (the
+						// process is exiting or the port stays claimed until it does); a leak is recoverable, the crash
+						// is not.  This state means a socket's teardown is wedged, which is its own bug -- say so loudly.
+						_logger.Log(EVerbosity.Error, $"WebSocketServer.StopListening: {_liveSockets.Count} live / {_pendingReaps} unreaped sockets after 30s; LEAKING the listener instead of disposing its handle under live I/O.");
+					}
+					else
+					{
+						// 2) No websocket holds an overlapped against the handle anymore -- now it is safe to stop and dispose the listener.
+						_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening Listener.Stop");
+						_listener.Stop();  // aborts only the pending GetContextAsync accepts, which have no websockets behind them
+						await _listenerUpdateTask.ConfigureAwait(false);  // wait until all the listener accept tasks have exited
+						_listener.Close();  // dispose the listener and its now-unused ThreadPoolBoundHandle
+					}
 
 					// 3) Stop the reaper and idle sweep (they shared a lifecycle with the listener).
 					if (_reaperCancel!=null)
@@ -302,9 +316,11 @@ namespace ReachableGames
 				catch (OperationCanceledException)  // if the token is cancelled, we pop to here
 				{
 				}
-				catch (ObjectDisposedException)
+				catch (Exception e) when (TransportTeardown.IsExpected(e))
 				{
-					// Listener disposed during shutdown; treat as normal exit path.
+					// Listener disposed/aborted during shutdown (Stop() faults everything before IsListening reads false);
+					// treat as the normal exit path (contract: TransportTeardown.cs).
+					_logger.Log(EVerbosity.Debug, $"WebSocketServer.ListenerUpdate - listener torn down {e.GetType().Name}: {e.Message}");
 				}
 				catch (Exception e)
 				{
@@ -381,15 +397,27 @@ namespace ReachableGames
 							}
 						}
 					}
-					catch (OperationCanceledException ex)  // timeout
-					{
-						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - websocket upgrade timeout {ex}");
+					catch (OperationCanceledException)  // timeout -- the client stalled the upgrade handshake and is almost
+					{                                   // certainly gone (chaos/malice/flaky network).  Client-caused, not actionable.
+						_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - websocket upgrade abandoned after {timeoutMS}ms (client stalled) {httpContext.Request.RawUrl}");
 						try
 						{
 							httpContext.Response.StatusCode = 500;
 							httpContext.Response.Close();  // this breaks the connection, otherwise it may linger forever
 						}
 						catch (Exception)  // HttpListenerResponse throws if the upgrade already touched it; the connection is dead either way
+						{
+						}
+					}
+					catch (Exception ex) when (TransportTeardown.IsExpected(ex))  // client vanished mid-upgrade -- benign teardown (contract: TransportTeardown.cs)
+					{
+						_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - websocket upgrade raced client teardown {httpContext.Request.RawUrl} {ex.GetType().Name}: {ex.Message}");
+						try
+						{
+							httpContext.Response.StatusCode = 500;
+							httpContext.Response.Close();
+						}
+						catch (Exception)  // same as above: the connection is dead either way
 						{
 						}
 					}
@@ -417,9 +445,13 @@ namespace ReachableGames
 							await _httpRequestCallback(httpContext).WaitAsync(responseTimeout.Token).ConfigureAwait(false);  // a handler that overruns the timeout gets abandoned and the connection closed
 						}
 					}
-					catch (OperationCanceledException ex)  // timeout
+					catch (OperationCanceledException)  // the handler overran the timeout and was abandoned -- almost always a client
+					{                                   // that hung up mid-reply, so the write blocked until the timeout.  Not actionable.
+						_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - http callback abandoned after {timeoutMS}ms (client likely gone) {httpContext.Request.RawUrl}");
+					}
+					catch (Exception ex) when (TransportTeardown.IsExpected(ex))  // client went away mid-reply -- benign teardown (contract: TransportTeardown.cs)
 					{
-						_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - http callback cancelled {ex}");
+						_logger.Log(EVerbosity.Debug, $"WebSocketServer.HandleConnection - http callback closed by client {httpContext.Request.RawUrl} {ex.GetType().Name}: {ex.Message}");
 					}
 					catch (Exception ex) // anything else
 					{
@@ -427,7 +459,10 @@ namespace ReachableGames
 					}
 					finally
 					{
-						httpContext.Response.Close();  // This frees all the memory associated with this connection.
+						// Close() frees this connection's memory, but on an already-disposed response (client hung up / listener
+						// teardown) it throws -- and this is a finally, so an unguarded throw would escape HandleConnection.
+						try { httpContext.Response.Close(); }
+						catch (Exception ex) when (TransportTeardown.IsExpected(ex)) { }
 					}
 				}
 			}
@@ -456,10 +491,12 @@ namespace ReachableGames
 				{
 					// Hand the socket to the reaper for final disposal.  We are running ON this socket's send task right now, so awaiting
 					// rgws.Shutdown() here would deadlock waiting for ourselves.  The reaper shuts it down from outside instead.
+					// ORDER MATTERS: the reap count goes up BEFORE the socket leaves the live set, so StopListening's
+					// combined (_liveSockets || _pendingReaps) wait can never observe a socket in neither.
 					_logger.Log(EVerbosity.Debug, $"WebSocketServer.OnDisconnection queued for reaping {rgws.DisplayId}");
+					Interlocked.Increment(ref _pendingReaps);
 					_liveSockets.Remove(rgws);  // no longer a candidate for the idle sweep
 					Metrics.RecordDisconnect(rgws);  // fold this socket's lifetime stats into the distributions, tagged by cause
-					Interlocked.Increment(ref _pendingReaps);
 					_reapQueue.Add(rgws);  // the reaper's WaitToReadAsync wakes on its own
 				}
 			}

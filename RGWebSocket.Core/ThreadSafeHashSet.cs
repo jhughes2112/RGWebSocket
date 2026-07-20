@@ -33,6 +33,20 @@ namespace Shared
 			}
 		}
 
+		// Atomically enforce a size cap while inserting.  A separate Count then Add check races under concurrent accepts.
+		public bool TryAddBelow(TKey key, int maximumCount)
+		{
+			_lock.EnterWriteLock();
+			try
+			{
+				return _hash.Count < maximumCount && _hash.Add(key);
+			}
+			finally
+			{
+				_lock.ExitWriteLock();
+			}
+		}
+
 		// Check if an item is in the set
 		public bool Contains(TKey key)
 		{

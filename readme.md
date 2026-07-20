@@ -5,13 +5,15 @@ RGWebSocket is a similarly powerful and user-friendly C# library for building hi
 
 ## Features
 
-- Provides a basic HTTP server that allows you to register functions to handle specific URL paths (exact and prefix matching).
+- Provides a basic HTTP server that allows you to register functions to handle specific URL paths (exact and prefix matching), with per-endpoint response caching and authorization.
 - Automatically upgrades basic HTTP connections to WebSocket connections.
 - Easy-to-use WebSocket client implementation for C# and Unity.
 - Simplified WebSocket server creation in C# with multi-threading support.
 - Text and binary messages flow through one pooled-buffer path -- no per-message allocations in the steady state.
 - Abstracts away the complexities of WebSocket communication, allowing you to focus on your application logic.
 - Compatible with standard WebSockets, since it is built on top of System.Net.WebSockets, including ws:// and wss:// protocols.
+- Clean logs in production: clients hanging up mid-operation is classified as normal teardown and logged at Debug, so Error-level output only contains things that are actually actionable.
+- Deterministic, crash-proof shutdown: the server waits for every socket to finish tearing down before disposing the listener's shared I/O handle, and if a socket wedges it leaks the listener rather than risking a native crash.
 
 ## Installation
 
@@ -140,7 +142,10 @@ RGWebSocketConfig.Configure(receiveBufferBytes: 4096, maxInboundMessageBytes: 16
 // Create a new WebSocket server instance on a port.
 IDataCollection? dataCollection = null;  // or pass your prometheus-backed IDataCollection derivative to have metrics pushed into it
 WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, dataCollection);
-webServer.RegisterExactEndpoint("/status", async (context) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")));
+// Every endpoint registration states its caching and authorization policy explicitly:
+//   cacheSeconds: 0 = never cached; N = successful GET responses are served from cache for N seconds (see below)
+//   authorizer:   null = public; non-null runs on EVERY request (even cache hits) before anything is served
+webServer.RegisterExactEndpoint("/status", async (context) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")), cacheSeconds: 5, authorizer: null);
 
 // Start listening.  This returns immediately; the listener runs on its own tasks.
 webServer.Start();
@@ -151,6 +156,13 @@ while (Console.ReadKey().KeyChar!='X') {}
 // Stop the web server, which tells the RGConnectionManager to shutdown all the connections
 await webServer.Shutdown().ConfigureAwait(false);
 ```
+
+## HTTP endpoints: response caching and authorization
+
+Every `RegisterExactEndpoint`/`RegisterPrefixEndpoint` call declares two policies, so nothing is implicit:
+
+- **`cacheSeconds`** — an endpoint registered with `cacheSeconds > 0` has its successful (200) **GET** responses cached by path+query for that many seconds, so a herd of identical requests costs one handler invocation instead of N — it behaves like a rate limiter on expensive public endpoints.  Non-GET requests, non-200 responses, and authorizer denials are never cached, so errors and actions always do the real work.  Never flag an endpoint whose *response* depends on who is asking (Authorization headers, cookies, roles) — the cache hands every admitted caller the same bytes.  Use `cacheSeconds: 0` for those.
+- **`authorizer`** — an optional `HTTPAuthorizer` gate that runs on **every** request, *including cache hits* — which is the whole point: a handler that checks auth internally never runs on a cache hit, so a cached endpoint's gate must live here.  Return `null` to admit the request, or a ready-to-send `(status, contentType, body)` denial.  An authorizer that throws fails **closed** (500, nobody admitted).
 
 ## Typed messages (recommended)
 
@@ -188,6 +200,14 @@ Knowing which thread runs your code is most of the battle with this kind of libr
 Every socket records **why** it died (`RGWebSocket.DisconnectReason`): remote close (with the peer's close status/description), transport error, the outbound/inbound circuit breakers, idle timeout, user code exception, or local close/shutdown.  `WebSocketServer.Metrics` aggregates distribution-oriented server metrics -- current/high-water concurrents, disconnect counts by cause, and power-of-two histograms (count/min/mean/p50/p90/p99/max) for inbound message sizes, per-socket lifetime send/receive counts and bytes, and connection duration.  Wire `Metrics.Report()` to an HTTP endpoint via `RegisterExactEndpoint` and you have a health page.
 
 For prometheus/Grafana, implement `IDataCollection` (gauges, counters, histograms) and pass it to `WebServer`/`WebSocketServer`; the library registers `rgws_*` metrics at startup and pushes events as they happen (connect/disconnect gauges and per-cause counters, message-size and per-socket-lifetime histograms, connection duration in seconds).  Your derivative owns `Generate()`; the library never formats a metrics page itself.
+
+## Log hygiene: the teardown contract
+
+A peer that vanishes mid-operation (closed its tab, lost its network, crashed) surfaces as an exception from whatever send/recv/close call was in flight.  That is the *normal* end of a connection, and it happens all day in healthy operation — so the library classifies those exception types in one place (`TransportTeardown.cs`) and logs them at **Debug**, never Error.  The rule everywhere is: avoid the throw with a state check where possible, squelch the known teardown races quietly (the detail still lands on `RGWebSocket.LastError` for post-mortems), and keep everything else loud with the full Error+stack.  The practical upshot: an Error in your logs means something actionable, not a client hanging up.  The same treatment covers HTTP: a client that aborts mid-reply or stalls the websocket upgrade handshake logs at Debug, not Error.
+
+## Shutdown behavior
+
+`WebSocketServer` shutdown is deterministic and defensive.  All sockets on a shared `HttpListener` post their receive I/O against one shared OS handle, so disposing the listener while any socket still has a receive in flight is a *native* crash, not an exception.  Shutdown therefore closes every socket, then waits (up to 30s) until every socket has both finished disconnecting **and** been reaped before touching the listener.  If a socket's teardown wedges past the deadline, the server deliberately leaks the listener instead of disposing the handle under live I/O — a leak is recoverable (the process is usually exiting anyway), the crash is not — and logs an Error saying so, since a wedged teardown is its own bug.
 
 ## Testing
 

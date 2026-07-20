@@ -80,24 +80,54 @@ namespace ReachableGames
 			//-------------------
 			// This is the set of http endpoint handlers are kept.  "/metrics" -> Metrics.HandleMetricsRequest, for example.
 			public delegate Task<(int, string, byte[])> HTTPRequestHandler(HttpListenerContext context);  // handlers should return (httpStatus, contentType, content) so we can handle errors gracefully
-			
-			// Exact match endpoints - use dictionary for fast O(1) lookup
-			private Dictionary<string, HTTPRequestHandler> _exactEndpointHandlers = new Dictionary<string, HTTPRequestHandler>();
-			
-			// Prefix match endpoints - use list for ordered checking, stored as (prefix, handler) tuples
-			private List<(string prefix, HTTPRequestHandler handler)> _prefixEndpointHandlers = new List<(string, HTTPRequestHandler)>();
 
-			// Register an endpoint that matches exactly
-			public void RegisterExactEndpoint(string urlPath, HTTPRequestHandler handler)
+			// Per-endpoint authorization, run by the server on EVERY request -- including ones answered from the
+			// response cache, which is the whole point: a handler that checks auth internally never runs on a cache
+			// hit, so a cached endpoint's gate MUST live here instead.  Return null to admit the request, or a
+			// ready-to-send (status, contentType, body) denial.  Denials are never cached.
+			public delegate Task<(int, string, byte[])?> HTTPAuthorizer(HttpListenerContext context);
+
+			// Exact match endpoints - use dictionary for fast O(1) lookup
+			private Dictionary<string, (HTTPRequestHandler handler, int cacheSeconds, HTTPAuthorizer? authorizer)> _exactEndpointHandlers = new Dictionary<string, (HTTPRequestHandler, int, HTTPAuthorizer?)>();
+
+			// Prefix match endpoints - use list for ordered checking, stored as (prefix, handler, cacheSeconds, authorizer) tuples
+			private List<(string prefix, HTTPRequestHandler handler, int cacheSeconds, HTTPAuthorizer? authorizer)> _prefixEndpointHandlers = new List<(string, HTTPRequestHandler, int, HTTPAuthorizer?)>();
+
+			//-------------------
+			// Outward-facing response cache: an endpoint registered with cacheSeconds > 0 has its successful (200) GET
+			// responses cached by path+query for that many seconds, so a herd of identical requests costs ONE handler
+			// invocation instead of N -- it behaves like a rate limiter on expensive public endpoints.  The cache is
+			// lazy: expiry is checked on the hit path, and a once-a-minute prune sweeps out whatever went stale.
+			// NEVER flag an endpoint whose response depends on WHO is asking (Authorization headers, cookies, roles) --
+			// the cache would happily serve one caller's authorized answer to the next caller.  Non-GET requests and
+			// non-200 responses are never cached, so errors and actions always do the real work.
+			private class CachedResponse
 			{
-				if (_exactEndpointHandlers.TryAdd(urlPath, handler) == false)
+				public int    _status;
+				public string _contentType = string.Empty;
+				public byte[] _content = Array.Empty<byte>();
+				public long   _expiresMs;
+			}
+			private readonly object _cacheLock = new object();
+			private readonly Dictionary<string, CachedResponse> _responseCache = new Dictionary<string, CachedResponse>();
+			private long _nextPruneMs;
+			private const long kCachePruneIntervalMs = 60_000;
+
+			// Register an endpoint that matches exactly.  BOTH policies are REQUIRED so every registration states them
+			// explicitly: cacheSeconds 0 = never cached, N = successful GET responses are served from cache for N
+			// seconds; authorizer null = public, non-null runs on EVERY request (cached or not) before anything is
+			// served.  An endpoint whose RESPONSE varies by caller must still use cacheSeconds:0 -- the authorizer
+			// makes gating cache-safe, but the cache still hands every admitted caller the same bytes.
+			public void RegisterExactEndpoint(string urlPath, HTTPRequestHandler handler, int cacheSeconds, HTTPAuthorizer? authorizer)
+			{
+				if (_exactEndpointHandlers.TryAdd(urlPath, (handler, cacheSeconds, authorizer)) == false)
 				{
 					_logger.Log(EVerbosity.Error, $"RegisterExactEndpoint {urlPath} is already defined.  Ignoring.");
 				}
 			}
 
-			// Register an endpoint that matches if the request path starts with the given prefix
-			public void RegisterPrefixEndpoint(string urlPrefix, HTTPRequestHandler handler)
+			// Register an endpoint that matches if the request path starts with the given prefix.  cacheSeconds and authorizer as above (required).
+			public void RegisterPrefixEndpoint(string urlPrefix, HTTPRequestHandler handler, int cacheSeconds, HTTPAuthorizer? authorizer)
 			{
 				// Check if this prefix is already registered
 				for (int i = 0; i < _prefixEndpointHandlers.Count; i++)
@@ -108,8 +138,8 @@ namespace ReachableGames
 						return;
 					}
 				}
-				
-				_prefixEndpointHandlers.Add((urlPrefix, handler));
+
+				_prefixEndpointHandlers.Add((urlPrefix, handler, cacheSeconds, authorizer));
 			}
 
 			// Unregister an exact endpoint
@@ -155,38 +185,82 @@ namespace ReachableGames
 				}
 				
 				HTTPRequestHandler? handler = null;
-				
+				HTTPAuthorizer? authorizer = null;
+				int cacheSeconds = 0;
+
 				// First, try exact match (fastest - O(1) dictionary lookup)
-				if (_exactEndpointHandlers.TryGetValue(relativeEndpoint, out handler))
+				if (_exactEndpointHandlers.TryGetValue(relativeEndpoint, out (HTTPRequestHandler handler, int cacheSeconds, HTTPAuthorizer? authorizer) exact))
 				{
-					// Found exact match
+					handler = exact.handler;
+					cacheSeconds = exact.cacheSeconds;
+					authorizer = exact.authorizer;
 				}
 				else
 				{
 					// If no exact match, check prefix matches (slower - O(n) list iteration)
-					foreach (var (prefix, prefixHandler) in _prefixEndpointHandlers)
+					foreach (var (prefix, prefixHandler, prefixCacheSeconds, prefixAuthorizer) in _prefixEndpointHandlers)
 					{
 						if (relativeEndpoint.StartsWith(prefix))
 						{
 							handler = prefixHandler;
+							cacheSeconds = prefixCacheSeconds;
+							authorizer = prefixAuthorizer;
 							break; // Use the first matching prefix
 						}
 					}
 				}
-				
+
 				if (handler != null)
 				{
-					try
+					// Authorization runs FIRST, on every request -- a cache hit must never skip the gate.  A denial is
+					// sent as-is and never cached.
+					(int, string, byte[])? deny = null;
+					if (authorizer != null)
 					{
-						(responseCode, responseContentType, responseContent) = await handler(httpContext).ConfigureAwait(false);
+						try
+						{
+							deny = await authorizer(httpContext).ConfigureAwait(false);
+						}
+						catch (Exception e)
+						{
+							_logger.Log(EVerbosity.Error, $"Exception in endpoint authorizer {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
+							deny = (500, "text/plain", System.Text.Encoding.UTF8.GetBytes("500 Internal Server Error"));  // fail CLOSED: an authorizer that throws admits nobody
+						}
 					}
-					catch (Exception e)
+					if (deny != null)
 					{
-						// Log the details, but never send exception text (stack frames, paths, internals) to whoever is on the other end of the socket.
-						_logger.Log(EVerbosity.Error, $"Exception in endpoint handler {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
-						responseCode = 500;
-						responseContentType = "text/plain";
-						responseContent = System.Text.Encoding.UTF8.GetBytes("500 Internal Server Error");
+						(responseCode, responseContentType, responseContent) = deny.Value;
+					}
+					else
+					{
+						long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+						PruneCacheIfDue(nowMs);
+						// Cache key is path+query: /api/search?q=al and /api/search?q=bob are different answers.
+						string cacheKey = httpContext.Request.Url?.PathAndQuery ?? relativeEndpoint;
+						bool cacheable = cacheSeconds > 0 && httpContext.Request.HttpMethod=="GET";
+						if (cacheable && TryGetCachedResponse(cacheKey, nowMs, out int cachedStatus, out string cachedType, out byte[] cachedContent))
+						{
+							responseCode = cachedStatus;
+							responseContentType = cachedType;
+							responseContent = cachedContent;
+						}
+						else
+						{
+							try
+							{
+								(responseCode, responseContentType, responseContent) = await handler(httpContext).ConfigureAwait(false);
+								if (cacheable && responseCode==200 && responseContent!=null)
+									StoreCachedResponse(cacheKey, nowMs + cacheSeconds*1000L, responseCode, responseContentType, responseContent);
+							}
+							catch (Exception e)
+							{
+								// Log the details, but never send exception text (stack frames, paths, internals) to whoever is on the other end of the socket.
+								_logger.Log(EVerbosity.Error, $"Exception in endpoint handler {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
+								responseCode = 500;
+								responseContentType = "text/plain";
+								responseContent = System.Text.Encoding.UTF8.GetBytes("500 Internal Server Error");
+							}
+						}
 					}
 				}
 				else
@@ -206,9 +280,71 @@ namespace ReachableGames
 						await httpContext.Response.OutputStream.WriteAsync(responseContent, 0, responseContent.Length).ConfigureAwait(false);
 					}
 				}
+				catch (Exception e) when (TransportTeardown.IsExpected(e))
+				{
+					// The client went away before we finished replying: it aborted the request, closed its tab, or HttpListener
+					// already disposed the response (e.g. after auto-411ing a bodyless POST).  The response is gone -- nothing to
+					// send, nothing actionable -- so log it quietly instead of a loud Error+stack (contract: TransportTeardown.cs).
+					_logger.Log(EVerbosity.Debug, $"Http response closed by client during write.  {httpContext.Request.Url?.ToString() ?? string.Empty} {e.GetType().Name}: {e.Message}");
+				}
 				catch (Exception e)
 				{
 					_logger.Log(EVerbosity.Error, $"Exception while trying to write to http response.  {httpContext.Request.Url?.ToString() ?? string.Empty} {e}");
+				}
+			}
+
+			//-------------------
+			// Response cache internals (invisible outside this class -- endpoints only ever declare a duration).
+
+			// A live cached answer for this exact path+query, if one exists.
+			private bool TryGetCachedResponse(string key, long nowMs, out int status, out string contentType, out byte[] content)
+			{
+				lock (_cacheLock)
+				{
+					if (_responseCache.TryGetValue(key, out CachedResponse? cached) && nowMs < cached._expiresMs)
+					{
+						status = cached._status;
+						contentType = cached._contentType;
+						content = cached._content;
+						return true;
+					}
+					status = 0;
+					contentType = string.Empty;
+					content = Array.Empty<byte>();
+					return false;
+				}
+			}
+
+			// Overwrite whatever was cached for this key with the freshly produced answer.
+			private void StoreCachedResponse(string key, long expiresMs, int status, string contentType, byte[] content)
+			{
+				lock (_cacheLock)
+				{
+					_responseCache[key] = new CachedResponse() { _status = status, _contentType = contentType, _content = content, _expiresMs = expiresMs };
+				}
+			}
+
+			// Lazy policing: at most once a minute, sweep out entries whose time has passed.  Expiry correctness never
+			// depends on this (the hit path checks _expiresMs); this only bounds memory for keys nobody asks for again.
+			private void PruneCacheIfDue(long nowMs)
+			{
+				lock (_cacheLock)
+				{
+					if (nowMs < _nextPruneMs)
+						return;
+					_nextPruneMs = nowMs + kCachePruneIntervalMs;
+					List<string>? dead = null;
+					foreach (KeyValuePair<string, CachedResponse> kvp in _responseCache)
+					{
+						if (nowMs >= kvp.Value._expiresMs)
+						{
+							dead ??= new List<string>();
+							dead.Add(kvp.Key);
+						}
+					}
+					if (dead!=null)
+						foreach (string key in dead)
+							_responseCache.Remove(key);
 				}
 			}
 		}
