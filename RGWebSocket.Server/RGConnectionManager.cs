@@ -17,11 +17,11 @@
 // the logger-only constructor and override OnRawMessage -- you get every message as (PooledArray, isText) and you own
 // the protocol.  The buffer is released by the library when your override returns; IncRef it if you keep it.
 
+using Logging;
 using System;
 using System.Buffers.Binary;
 using System.Net;
 using System.Threading.Tasks;
-using Logging;
 
 namespace ReachableGames
 {
@@ -29,27 +29,27 @@ namespace ReachableGames
 	{
 		public abstract class RGConnectionManager
 		{
-			private readonly IMessageFactory? _factory;  // null = raw mode; the deriver overrides OnRawMessage instead
-			protected readonly ILogging _logger;
+			private readonly   IMessageFactory? _factory; // null = raw mode; the deriver overrides OnRawMessage instead
+			protected readonly ILogging         _logger;
 
 			// Typed mode (the normal case): messages flow through the factory's codec.
 			protected RGConnectionManager(IMessageFactory factory, ILogging logger)
 			{
-				if (factory==null)
+				if (factory == null)
 					throw new ArgumentNullException(nameof(factory));
-				if (logger==null)
+				if (logger == null)
 					throw new ArgumentNullException(nameof(logger));
 				_factory = factory;
-				_logger = logger;
+				_logger  = logger;
 			}
 
 			// Raw mode (advanced): no factory; you MUST override OnRawMessage and speak your own protocol.
 			protected RGConnectionManager(ILogging logger)
 			{
-				if (logger==null)
+				if (logger == null)
 					throw new ArgumentNullException(nameof(logger));
 				_factory = null;
-				_logger = logger;
+				_logger  = logger;
 			}
 
 			// Your side of the contract.  OnConnection runs before the socket's pumps start (nothing can arrive until you
@@ -58,15 +58,15 @@ namespace ReachableGames
 			// concurrently, and blocking here stalls that socket's receive pump.  Shutdown must Close() every socket you track.
 			public abstract Task OnConnection(RGWebSocket rgws, HttpListenerContext context);
 			public abstract Task OnDisconnect(RGWebSocket rgws);
-			public abstract Task OnMessage(RGWebSocket rgws, IRGMessage msg);  // never called in raw mode; stub it with Task.CompletedTask
-			public abstract Task Shutdown();
+			public abstract Task OnMessage   (RGWebSocket rgws, IRGMessage msg); // never called in raw mode; stub it with Task.CompletedTask
+			public abstract Task Shutdown    ();
 
 			// Serialize and queue a typed message.  Safe from any thread.
 			public void Send(RGWebSocket rgws, IRGMessage msg)
 			{
-				if (_factory==null)
+				if (_factory == null)
 					throw new InvalidOperationException("This RGConnectionManager was constructed in raw mode (no IMessageFactory); send with rgws.Send() directly.");
-				using (PooledArray buffer = RGMessagePacker.Pack(_factory, msg))  // the send queue takes its own reference; ours releases here
+				using (PooledArray buffer = RGMessagePacker.Pack(_factory, msg)) // the send queue takes its own reference; ours releases here
 				{
 					rgws.Send(buffer);
 				}
@@ -76,33 +76,55 @@ namespace ReachableGames
 			// pipeline.  Override it (with the raw-mode constructor) to speak your own protocol; do not call base if you do.
 			protected internal virtual Task OnRawMessage(RGWebSocket rgws, PooledArray msg, bool isText)
 			{
-				if (_factory==null)  // raw-mode construction without overriding OnRawMessage is a config error, and every message would hit it -- kill the connection so it's loud
+				if (_factory == null) // raw-mode construction without overriding OnRawMessage is a config error, and every message would hit it -- kill the connection so it's loud
 				{
-					_logger.Log(EVerbosity.Error, $"RGConnectionManager: raw mode (no IMessageFactory) but OnRawMessage is not overridden.  Disconnecting {rgws.DisplayId} (ProtocolError).");
-					rgws.Close(EDisconnectReason.ProtocolError);
+					KillProtocolViolator(rgws, EVerbosity.Error, $"RGConnectionManager: raw mode (no IMessageFactory) but OnRawMessage is not overridden.  Disconnecting {rgws.DisplayId} (ProtocolError).");
 					return Task.CompletedTask;
 				}
 				if (isText)
 				{
-					_logger.Log(EVerbosity.Warning, $"RGConnectionManager: text frame from {rgws.DisplayId} on a binary-only typed connection.  Disconnecting (ProtocolError).");
-					rgws.Close(EDisconnectReason.ProtocolError);
+					KillProtocolViolator(rgws, EVerbosity.Warning, $"RGConnectionManager: text frame from {rgws.DisplayId} on a binary-only typed connection.  Disconnecting (ProtocolError).");
 					return Task.CompletedTask;
 				}
-				if (msg.Length<4)  // runt frame: not even a type id header
+				if (msg.Length < 4) // runt frame: not even a type id header
 				{
-					_logger.Log(EVerbosity.Warning, $"RGConnectionManager: runt frame ({msg.Length} bytes) from {rgws.DisplayId}.  Disconnecting (ProtocolError).");
-					rgws.Close(EDisconnectReason.ProtocolError);
+					KillProtocolViolator(rgws, EVerbosity.Warning, $"RGConnectionManager: runt frame ({msg.Length} bytes) from {rgws.DisplayId}.  Disconnecting (ProtocolError).");
 					return Task.CompletedTask;
 				}
-				int typeId = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(msg.data, 0, 4));
-				IRGMessage? typed = _factory.Deserialize(typeId, new ReadOnlySpan<byte>(msg.data, 4, msg.Length-4));  // span: the compiler guarantees the pooled buffer cannot escape this call
-				if (typed==null)
+				int         typeId = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(msg.data, 0, 4));
+				IRGMessage? typed;
+				try
 				{
-					_logger.Log(EVerbosity.Warning, $"RGConnectionManager: factory rejected message typeId={typeId} len={msg.Length-4} from {rgws.DisplayId}.  Disconnecting (ProtocolError).");
-					rgws.Close(EDisconnectReason.ProtocolError);
+					typed = _factory.Deserialize(typeId, new ReadOnlySpan<byte>(msg.data, 4, msg.Length - 4)); // span: the compiler guarantees the pooled buffer cannot escape this call
+				}
+				catch (Exception e)
+				{
+					// A codec that THROWS on a malformed payload means exactly what returning null means -- the peer sent
+					// something this protocol cannot parse.  Without this, the throw escapes to the receive pump and is
+					// attributed as UserCodeException, so a hostile peer's garbage shows up in the metrics as OUR bug.
+					KillProtocolViolator(rgws, EVerbosity.Warning, $"RGConnectionManager: factory THREW on typeId={typeId} len={msg.Length - 4} from {rgws.DisplayId}.  Disconnecting (ProtocolError).  {e}");
+					return Task.CompletedTask;
+				}
+				if (typed == null)
+				{
+					KillProtocolViolator(rgws, EVerbosity.Warning, $"RGConnectionManager: factory rejected message typeId={typeId} len={msg.Length - 4} from {rgws.DisplayId}.  Disconnecting (ProtocolError).");
 					return Task.CompletedTask;
 				}
 				return OnMessage(rgws, typed);
+			}
+
+			// Close a peer for speaking the wrong protocol, logging the reason EXACTLY ONCE per connection.  Close() only
+			// asks the socket to shut down, and every frame the peer already had in flight lands here in the meantime --
+			// so a single violation used to produce a burst of identical log lines, a log flood driven by precisely the
+			// traffic this check exists to stop.  The socket's own disconnect stamp is the latch: it is set first-wins, so
+			// once a cause is on the record this connection has already been condemned and needs no second announcement.
+			private void KillProtocolViolator(RGWebSocket rgws, EVerbosity verbosity, string message)
+			{
+				if (rgws.DisconnectReason == EDisconnectReason.None)
+				{
+					_logger.Log(verbosity, message);
+					rgws.Close(EDisconnectReason.ProtocolError);
+				}
 			}
 		}
 	}

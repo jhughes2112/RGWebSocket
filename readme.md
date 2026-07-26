@@ -137,15 +137,40 @@ RGConnectionManager connectionMgr = new YourConnectionManager(new YourMessageFac
 // nonsense; it also throws if called after any socket/server exists), or skip it entirely to accept the defaults.
 // A game server probably wants the idle sweep on, so clients that vanish behind an Ingress get cleaned up -- clients
 // must then heartbeat more often than that interval (see the notes in RGWebSocketConfig.cs):
-RGWebSocketConfig.Configure(receiveBufferBytes: 4096, maxInboundMessageBytes: 16*1024*1024, maxUnsentBytes: 4*1024*1024, idleDisconnectSeconds: 300, idleSweepPeriodSeconds: 60);
+// maxConcurrentWebSockets is the connection-count circuit breaker: at the cap, further upgrades are refused with a 503
+// (counted in the metrics as refused upgrades).  Every other breaker is per-connection; without this one an attacker
+// simply opens connections until the process dies.  0 disables it; size it from your capacity math with headroom.
+// maxRecvQueueBytes is the client-side mirror of maxUnsentBytes: inbound messages wait in a queue until your game loop
+// calls ReceiveAll, so a stalled loop (or a server that outruns it) grows that queue without limit.  At the cap the
+// connection is closed with EDisconnectReason.InboundBacklog rather than silently dropping messages.  0 disables it.
+// webSocketKeepAliveSeconds is the PROTOCOL ping/pong interval (0 disables).  Do not over-trust it: through an
+// ingress/proxy it only covers the hop it is on (server<->proxy), so it tells you nothing about whether the client is
+// alive, and .NET answers pings internally so they never refresh the idle sweep.  It exists only to stop an
+// intermediary idling the connection out -- keep it well under your proxy's idle timeout (commonly 60s), and remember
+// that every socket pays it, so seconds-scale values are a packet storm that buys nothing.
+RGWebSocketConfig.Configure(receiveBufferBytes: 4096, maxInboundMessageBytes: 16*1024*1024, maxUnsentBytes: 4*1024*1024, maxRecvQueueBytes: 8*1024*1024, idleDisconnectSeconds: 300, idleSweepPeriodSeconds: 60, webSocketKeepAliveSeconds: 30, maxConcurrentWebSockets: 10000);
 
 // Create a new WebSocket server instance on a port.
 IDataCollection? dataCollection = null;  // or pass your prometheus-backed IDataCollection derivative to have metrics pushed into it
-WebServer webServer = new WebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, dataCollection);
+
+// The upgrade authorizer runs BEFORE every websocket handshake is accepted -- this is where Origin validation and
+// connection auth belong.  Browsers place no restriction on which sites may open a websocket to you (cross-site
+// websocket hijacking), so if browsers connect to this server, check Origin here.  Return null to admit, or a
+// ready-to-send denial; a denial is a plain HTTP status and never costs a socket.  Pass null explicitly for a public server.
+RGWebSocketServer.UpgradeAuthorizer? wsAuth = (context, token) =>
+{
+    string? origin = context.Request.Headers["Origin"];
+    if (origin!=null && origin!="https://your.game.example")
+        return Task.FromResult<(int, string, byte[])?>((403, "text/plain", System.Text.Encoding.UTF8.GetBytes("403 Forbidden")));
+    return Task.FromResult<(int, string, byte[])?>(null);
+};
+RGWebServer webServer = new RGWebServer("http://+:24680/", listenerTasks, connectionTimeoutMS, idleSeconds, connectionMgr, logger, dataCollection, wsAuth);
 // Every endpoint registration states its caching and authorization policy explicitly:
-//   cacheSeconds: 0 = never cached; N = successful GET responses are served from cache for N seconds (see below)
-//   authorizer:   null = public; non-null runs on EVERY request (even cache hits) before anything is served
-webServer.RegisterExactEndpoint("/status", async (context) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")), cacheSeconds: 5, authorizer: null);
+//   cacheSeconds:      0 = never cached; N = successful GET responses are served from cache for N seconds (see below)
+//   cacheIgnoresQuery: true = the query string is dropped from the cache key (use for file serving / static pages, see below)
+//   authorizer:        null = public; non-null runs on EVERY request (even cache hits) before anything is served
+// The handler's token fires if the request overruns the server's connection timeout -- observe it and stop working.
+webServer.RegisterExactEndpoint("/status", async (context, token) => (200, "text/plain", System.Text.Encoding.UTF8.GetBytes("OK")), cacheSeconds: 5, cacheIgnoresQuery: false, authorizer: null);
 
 // Start listening.  This returns immediately; the listener runs on its own tasks.
 webServer.Start();
@@ -159,10 +184,15 @@ await webServer.Shutdown().ConfigureAwait(false);
 
 ## HTTP endpoints: response caching and authorization
 
-Every `RegisterExactEndpoint`/`RegisterPrefixEndpoint` call declares two policies, so nothing is implicit:
+Every `RegisterExactEndpoint`/`RegisterPrefixEndpoint` call declares three policies, so nothing is implicit:
 
 - **`cacheSeconds`** — an endpoint registered with `cacheSeconds > 0` has its successful (200) **GET** responses cached by path+query for that many seconds, so a herd of identical requests costs one handler invocation instead of N — it behaves like a rate limiter on expensive public endpoints.  Non-GET requests, non-200 responses, and authorizer denials are never cached, so errors and actions always do the real work.  Never flag an endpoint whose *response* depends on who is asking (Authorization headers, cookies, roles) — the cache hands every admitted caller the same bytes.  Use `cacheSeconds: 0` for those.
-- **`authorizer`** — an optional `HTTPAuthorizer` gate that runs on **every** request, *including cache hits* — which is the whole point: a handler that checks auth internally never runs on a cache hit, so a cached endpoint's gate must live here.  Return `null` to admit the request, or a ready-to-send `(status, contentType, body)` denial.  An authorizer that throws fails **closed** (500, nobody admitted).
+- **`cacheIgnoresQuery`** — when true, the query string is **dropped** from the cache key, so `/file?a=1` and `/file?a=2` are the same entry.  Use it whenever the query doesn't change the answer (file serving, static pages): otherwise every unique query string mints a fresh cache entry, and an attacker can mint them for free.  Leave it false for endpoints like `/search?q=...` where the query *is* the question.
+- **`authorizer`** — an optional `HTTPAuthorizer` gate that runs on **every** request, *including cache hits* — which is the whole point: a handler that checks auth internally never runs on a cache hit, so a cached endpoint's gate must live here.  Return `null` to admit the request, or a ready-to-send `(status, contentType, body)` denial.  An authorizer that throws fails **closed** (500, nobody admitted).  It receives the request's `CancellationToken` — observe it, because abandoning the wait does not abandon the database or token-service call behind it.
+
+The cache is **bounded**, because anything a remote caller can grow is an attack surface: payloads over **100KB** are never cached (a big file served through a cached endpoint must not become resident memory per unique URL), the whole cache never exceeds a **32MB** budget (when full, expired entries are pruned immediately; if still full, answers are served uncached and a rate-limited Warning is logged), and abandoned (timed-out) requests never store anything.  `CacheEntryCount`/`CacheTotalBytes` expose the live footprint for health pages.
+
+Handler timeouts are **honest**: a handler that overruns the server's connection timeout has its cancellation token fired (observe it and stop working — anything returned after cancellation is thrown away, never sent and never cached), and the client gets a real **503** (or a hard abort if headers already went out) instead of a silent empty 200.  Each overrun logs a Warning and increments `Metrics.HttpHandlerTimeouts` (`rgws_http_handler_timeouts_total`) — it is a server-side fault worth alerting on, distinct from a client that merely hung up mid-reply (which stays at Debug).
 
 ## Typed messages (recommended)
 
@@ -190,10 +220,10 @@ Knowing which thread runs your code is most of the battle with this kind of libr
 
 - `RGWebSocket.Send()` (both overloads) is safe to call from **any thread** at any time.  Messages are queued and a dedicated send task drains them in order.
 - `RGConnectionManager.OnMessage` (and `OnRawMessage`, if you override it) runs on **that socket's receive task**.  One message at a time per socket, but different sockets call you **concurrently** -- anything they touch that is shared must be thread-safe.  Do not block in these callbacks (no sync waits on other locks, DBs, etc); you stall that socket's receive pump and, at scale, the thread pool.
-- `RGConnectionManager.OnConnection` runs before the socket's pumps start -- nothing can arrive until you return.
+- `RGConnectionManager.OnConnection` runs before the socket's pumps start -- nothing can arrive until you return.  Throwing rejects the socket, but the 101 handshake has already succeeded by then -- reject in the **upgrade authorizer** instead when you want a clean 401/403 before any socket exists.
 - `RGConnectionManager.OnDisconnect` runs on **the dying socket's send task**.  Never call `RGWebSocket.Shutdown()` from there (it would wait for itself); `WebSocketServer` hands the socket to a reaper task that disposes it from outside.
 - `RGUnityWebSocket` queues everything; you drain with `ReceiveAll()` from **your main thread** whenever you like.  The `disconnectCallback` fires on the socket's send task -- set flags, don't touch your world state from it.
-- `WebServer` HTTP endpoint handlers run on thread pool tasks, one per request, bounded by the connection timeout.
+- `WebServer` HTTP endpoint handlers run on thread pool tasks, one per request, bounded by the connection timeout.  The handler's `CancellationToken` fires at that deadline; past it the server has already answered 503, so observe the token and stop working.
 
 ## Disconnect causes and metrics
 
@@ -203,7 +233,7 @@ For prometheus/Grafana, implement `IDataCollection` (gauges, counters, histogram
 
 ## Log hygiene: the teardown contract
 
-A peer that vanishes mid-operation (closed its tab, lost its network, crashed) surfaces as an exception from whatever send/recv/close call was in flight.  That is the *normal* end of a connection, and it happens all day in healthy operation — so the library classifies those exception types in one place (`TransportTeardown.cs`) and logs them at **Debug**, never Error.  The rule everywhere is: avoid the throw with a state check where possible, squelch the known teardown races quietly (the detail still lands on `RGWebSocket.LastError` for post-mortems), and keep everything else loud with the full Error+stack.  The practical upshot: an Error in your logs means something actionable, not a client hanging up.  The same treatment covers HTTP: a client that aborts mid-reply or stalls the websocket upgrade handshake logs at Debug, not Error.
+A peer that vanishes mid-operation (closed its tab, lost its network, crashed) surfaces as an exception from whatever send/recv/close call was in flight.  That is the *normal* end of a connection, and it happens all day in healthy operation — so the library classifies those exception types in one place (`TransportTeardown.cs`) and logs them at **Debug**, never Error.  The rule everywhere is: avoid the throw with a state check where possible, squelch the known teardown races quietly (the detail still lands on `RGWebSocket.LastError` for post-mortems), and keep everything else loud with the full Error+stack.  The practical upshot: an Error in your logs means something actionable, not a client hanging up.  The same treatment covers HTTP: a client that aborts mid-reply or stalls the websocket upgrade handshake logs at Debug, not Error.  An HTTP handler that overruns its deadline is the deliberate exception — that is a *server-side* fault, so it logs at Warning and counts in the metrics rather than hiding among the teardown noise.
 
 ## Shutdown behavior
 

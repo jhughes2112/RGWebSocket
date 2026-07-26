@@ -34,7 +34,7 @@ namespace ReachableGames
 		// RGUnityWebSocket speak the identical wire format from one place.  The caller owns the returned reference.
 		static public class RGMessagePacker
 		{
-			[ThreadStatic] static private PooledBufferWriter? tWriter;  // serialize is synchronous within a Send call, so per-thread reuse is safe and allocation-free
+			[ThreadStatic] static private PooledBufferWriter? tWriter; // serialize is synchronous within a Send call, so per-thread reuse is safe and allocation-free
 
 			static public PooledArray Pack(IMessageFactory factory, IRGMessage msg)
 			{
@@ -64,31 +64,42 @@ namespace ReachableGames
 		// NOT thread-safe -- the typed layer keeps one per thread via [ThreadStatic].
 		public class PooledBufferWriter : IBufferWriter<byte>
 		{
-			private PooledArray? _buffer = null;
+			private PooledArray? _buffer  = null;
 			private int          _written = 0;
 
 			public void Begin(int initialCapacity)
 			{
-				if (_buffer!=null)  // a previous serialize threw between Begin and Detach; don't leak its buffer
-					using (_buffer) { }
-				_buffer = PooledArray.BorrowFromPool(initialCapacity);
+				if (_buffer != null) // a previous serialize threw between Begin and Detach; don't leak its buffer
+					using (_buffer)
+					{ }
+				_buffer  = PooledArray.BorrowFromPool(initialCapacity);
 				_written = 0;
 			}
 
+			// Validated, because IBufferWriter is implemented for FOREIGN serializers: a codec that advances past what it
+			// actually wrote (or by a negative amount) would set the finished message's Length beyond its buffer, and the
+			// send path would then read whatever the pool last had in those bytes -- another connection's data on the
+			// wire.  Fail loudly at the buggy Advance instead of silently shipping memory.
 			public void Advance(int count)
 			{
+				if (_buffer == null)
+					throw new InvalidOperationException("PooledBufferWriter.Advance called before Begin.");
+				if (count < 0)
+					throw new ArgumentOutOfRangeException(nameof(count), count, "Cannot advance by a negative amount.");
+				if (_written + count > _buffer.data.Length)
+					throw new ArgumentOutOfRangeException(nameof(count), count, $"Advance({count}) past the end of the buffer: {_written} written of {_buffer.data.Length} capacity.  A serializer advanced further than it wrote into.");
 				_written += count;
 			}
 
 			public Memory<byte> GetMemory(int sizeHint = 0)
 			{
-				EnsureCapacity(sizeHint<=0 ? 256 : sizeHint);
+				EnsureCapacity(sizeHint <= 0 ? 256 : sizeHint);
 				return new Memory<byte>(_buffer!.data, _written, _buffer.data.Length - _written);
 			}
 
 			public Span<byte> GetSpan(int sizeHint = 0)
 			{
-				EnsureCapacity(sizeHint<=0 ? 256 : sizeHint);
+				EnsureCapacity(sizeHint <= 0 ? 256 : sizeHint);
 				return new Span<byte>(_buffer!.data, _written, _buffer.data.Length - _written);
 			}
 
@@ -96,9 +107,9 @@ namespace ReachableGames
 			public PooledArray Detach()
 			{
 				PooledArray ret = _buffer!;
-				ret.Length = _written;
-				_buffer = null;
-				_written = 0;
+				ret.Length      = _written;
+				_buffer         = null;
+				_written        = 0;
 				return ret;
 			}
 
@@ -108,7 +119,8 @@ namespace ReachableGames
 				{
 					PooledArray bigger = PooledArray.BorrowFromPool(Math.Max(_buffer.data.Length * 2, _written + size));
 					Buffer.BlockCopy(_buffer.data, 0, bigger.data, 0, _written);
-					using (_buffer) { }  // old bucket goes back to the pool
+					using (_buffer)
+					{ } // old bucket goes back to the pool
 					_buffer = bigger;
 				}
 			}

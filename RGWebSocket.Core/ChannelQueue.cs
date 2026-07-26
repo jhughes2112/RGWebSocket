@@ -31,18 +31,41 @@ namespace ReachableGames
 				_channel = Channel.CreateUnbounded<T>(new UnboundedChannelOptions() { SingleReader = singleReader, SingleWriter = singleWriter });
 			}
 
-			public int Count => _channel.Reader.Count;
+			// Maintained by hand, because ChannelReader.Count is NOT available on the channels we actually use: any
+			// SingleReader channel gets the optimized single-consumer implementation, whose CanCount is false and whose
+			// Count THROWS NotSupportedException.  Every queue in this library is SingleReader, so reading Reader.Count
+			// was an unconditional crash for anyone who enabled RGWS_LOGGING (the Unity client logs it per message).
+			private int _count;
+			public  int Count => Volatile.Read(ref _count);
 
-			public void Add(T item)
+			// Returns FALSE if the queue has been Completed -- meaning nobody will ever drain this item, so the caller
+			// still owns it and must release whatever it holds.  Ignoring this return value on a queue that carries
+			// pooled buffers leaks them: see RGWebSocket.Send.
+			public bool Add(T item)
 			{
-				_channel.Writer.TryWrite(item);  // unbounded channel: TryWrite cannot fail while the channel is open, and we never complete it
+				if (_channel.Writer.TryWrite(item) == false)
+					return false;
+				Interlocked.Increment(ref _count);
+				return true;
+			}
+
+			// Permanently close the queue to writers.  Already-queued items remain readable (drain after completing),
+			// but every later Add fails instead of silently accepting an item no consumer will ever take.  This is what
+			// closes the shutdown race: a producer that checked "still alive" a moment ago finds out its item was not
+			// accepted, rather than parking a pooled buffer in a queue whose consumer has already exited.
+			public void Complete()
+			{
+				_channel.Writer.TryComplete();
 			}
 
 			// Bulk-drain everything currently queued into the caller's list (appends; caller clears).
 			public void MoveTo(List<T> list)
 			{
 				while (_channel.Reader.TryRead(out T item))
+				{
+					Interlocked.Decrement(ref _count);
 					list.Add(item);
+				}
 			}
 
 			// Park until something is available to read or the token cancels (throws OperationCanceledException, flow control).

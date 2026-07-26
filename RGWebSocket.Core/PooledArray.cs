@@ -8,10 +8,10 @@
 // Comment this in to not recycle buffers, but instead just allocate them and deallocate them according to refcount.
 //#define DISABLE_RECYCLING
 
-using System;
-using System.Threading;
-using System.Collections.Generic;
 using Logging;
+using System;
+using System.Collections.Generic;
+using System.Threading;
 
 //-------------------
 
@@ -24,14 +24,17 @@ namespace ReachableGames
 		// This is a fake pooled array, for debugging and performance comparison.  There is only a refcount, no recycling.  All requests for memory blocks are allocated at the time of request.
 		public class PooledArray : IDisposable
 		{
-			static private long _liveAllocs = 0;
-			static private long _liveAllocSize = 0;
-			static public long GetLiveAllocs()    { return _liveAllocs; }
-			static public long GetLiveAllocSize() { return _liveAllocSize; }
-			static public PooledArray BorrowFromPool(int length)
+			static private long        _liveAllocs    = 0;
+			static private long        _liveAllocSize = 0;
+			static public  long        GetLiveAllocs   () { return _liveAllocs; }
+			static public  long        GetLiveAllocSize() { return _liveAllocSize; }
+			public const   int         kMaxLength = 1<<30; // mirror the real pool's bounds so the debug build fails the same way
+			static public  PooledArray BorrowFromPool(int length)
 			{
+				if (length<0 || length>kMaxLength)
+					throw new ArgumentOutOfRangeException(nameof(length), length, $"PooledArray supports 0..{kMaxLength} bytes.");
 				PooledArray ret = new PooledArray(length);
-				ret.Length = length;
+				ret.Length      = length;
 				ret.IncRef();
 				Interlocked.Increment(ref _liveAllocs);
 				Interlocked.Add(ref _liveAllocSize, length);
@@ -50,17 +53,17 @@ namespace ReachableGames
 					Array.Clear(data, 0, Length);
 #endif
 					Interlocked.Decrement(ref _liveAllocs);
-					Interlocked.Add(ref _liveAllocSize, -Length);  // must happen BEFORE Length is reset, or the stat never shrinks
+					Interlocked.Add(ref _liveAllocSize, -Length); // must happen BEFORE Length is reset, or the stat never shrinks
 					Length = 0;
 				}
 			}
 			public void IncRef() { Interlocked.Increment(ref refCount); }
-			void IDisposable.Dispose() { DecRef(); }
+			void IDisposable.Dispose()      { DecRef(); }
 			private PooledArray(int length) { data = new byte[length]; }
 
-			public  byte[]      data;
-			public  int         Length = 0;
-			private int         refCount = 0;
+			public  byte[] data;
+			public  int    Length   = 0;
+			private int    refCount = 0;
 		}
 #else
 		//-------------------
@@ -68,29 +71,29 @@ namespace ReachableGames
 		public class PooledArray : IDisposable
 		{
 			// This has an internal pool, so as not to pollute the StorageLocalBinary class.
-			static private long _liveAllocs = 0;
-			static private long _liveAllocSize = 0;
-			static private long _warnAt     = 10000;
-			static private ILogging? _logger;  // if you assign a logger, you'll get leak alerts at >10,000 buffers.
+			static private long      _liveAllocs    = 0;
+			static private long      _liveAllocSize = 0;
+			static private long      _warnAt        = 10000;
+			static private ILogging? _logger; // if you assign a logger, you'll get leak alerts at >10,000 buffers.
 
 			// Bucket sizes are powers of two, so the pool is a flat array indexed by exponent -- no dictionary, no reader/writer
 			// lock on the hot path, just one direct index.  Slots below 2^7 (=128, the minimum bucket) simply go unused.
 			static private readonly LockingList<PooledArray>[] _pools = CreatePools();
-			static private LockingList<PooledArray>[] CreatePools()
+			static private          LockingList<PooledArray>[] CreatePools()
 			{
 				LockingList<PooledArray>[] pools = new LockingList<PooledArray>[32];
-				for (int i=0; i<pools.Length; i++)
+				for (int i = 0; i < pools.Length; i++)
 					pools[i] = new LockingList<PooledArray>();
 				return pools;
 			}
 #if LEAK_DEBUGGING
-			static private LockingList<PooledArray> _borrowedArrays = new LockingList<PooledArray>();   // Keep a list of all the PooledArray objects currently borrowed by something.
-			static private long _lastAgeCheckTicks = 0L;
-			private const double AGE_CHECK_FREQUENCY_SECONDS = 2.0;                       // How often to check the age of borrowed PooledArray objects.
-			private const double AGE_MONITORING_SECONDS = 2.0;                            // How many seconds old an object must be to log its age.
-			private const double AGE_FULL_STACK_SECONDS = AGE_MONITORING_SECONDS + 10.0;  // How many seconds old an object must be to log the full call stack from its borrower. It's always larger than AGE_MONITORING_SECONDS, so we add to that.
+			static private LockingList<PooledArray> _borrowedArrays             = new LockingList<PooledArray>(); // Keep a list of all the PooledArray objects currently borrowed by something.
+			static private long                     _lastAgeCheckTicks          = 0L;
+			private const  double                   AGE_CHECK_FREQUENCY_SECONDS = 2.0; // How often to check the age of borrowed PooledArray objects.
+			private const  double                   AGE_MONITORING_SECONDS      = 2.0; // How many seconds old an object must be to log its age.
+			private const  double                   AGE_FULL_STACK_SECONDS      = AGE_MONITORING_SECONDS + 10.0; // How many seconds old an object must be to log the full call stack from its borrower. It's always larger than AGE_MONITORING_SECONDS, so we add to that.
 #endif
-			static public long GetLiveAllocs()    { return _liveAllocs; }
+			static public long GetLiveAllocs   () { return _liveAllocs; }
 			static public long GetLiveAllocSize() { return _liveAllocSize; }
 
 			static public void Initialize(ILogging logger, long warnAt)
@@ -99,11 +102,19 @@ namespace ReachableGames
 				_warnAt = warnAt;
 			}
 
+			// Largest borrowable buffer.  Past 2^30, the power-of-two rounding below overflows int (2^30 << 1 goes
+			// negative, then sticks at zero) and the loop never exits -- so an oversized request is a hard throw, not
+			// a hang.  Nothing legitimate wants a >1GB single buffer; a request for one is a bug or an attack.
+			public const int kMaxLength = 1<<30;
+
 			static public PooledArray BorrowFromPool(int length)
 			{
+				if (length < 0 || length > kMaxLength)
+					throw new ArgumentOutOfRangeException(nameof(length), length, $"PooledArray supports 0..{kMaxLength} bytes.");
+
 				// Round up to powers of two, so we don't have too many different categories, but none smaller than 128 bytes.
 				// The same loop computes the bucket index, which is a direct slot in _pools.
-				int bucket = 7;
+				int bucket        = 7;
 				int roundedLength = 128;
 				while (roundedLength < length)
 				{
@@ -112,10 +123,10 @@ namespace ReachableGames
 				}
 
 				LockingList<PooledArray> poolList = _pools[bucket];
-				PooledArray? ret = poolList.PopBack();
-				if (ret==null)
+				PooledArray?             ret      = poolList.PopBack();
+				if (ret == null)
 				{
-					ret = new PooledArray(roundedLength, poolList);  // create a new record if we're ever out of them; it remembers its home bucket so returning it costs no lookup at all
+					ret = new PooledArray(roundedLength, poolList); // create a new record if we're ever out of them; it remembers its home bucket so returning it costs no lookup at all
 				}
 				ret.Length = length;
 
@@ -137,7 +148,7 @@ namespace ReachableGames
 				Interlocked.Increment(ref _liveAllocs);
 				Interlocked.Add(ref _liveAllocSize, roundedLength);
 
-				if (_liveAllocs>_warnAt)// && _liveAllocs % 100 == 0)
+				if (_liveAllocs > _warnAt) // && _liveAllocs % 100 == 0)
 				{
 					_logger?.Log(EVerbosity.Info, $"Leak detected in PooledArray.  Current buffer size: {length}  Live buffers: {_liveAllocs}");
 				}
@@ -153,10 +164,10 @@ namespace ReachableGames
 				// Check the RESULT of the decrement -- pre-checking refCount is a race, and a double-Dispose could slip from 1 -> 0 -> -1 silently,
 				// which would put this buffer back in the pool twice and hand the same array to two different owners.
 				int newCount = Interlocked.Decrement(ref refCount);
-				if (newCount<0 || _data==null)
+				if (newCount < 0 || _data == null)
 					throw new InvalidOperationException("Logic error: Reference count went negative in PooledArray.  Probably a double-Dispose.");
 
-				if (newCount==0)
+				if (newCount == 0)
 				{
 #if DEBUG
 					// Use-after-free tripwire: whole-buffer fill so a stale reference reading ANY part of the buffer (including the
@@ -164,10 +175,10 @@ namespace ReachableGames
 					Array.Fill<byte>(_data, 0xBE);
 #endif
 					Length = -1;
-					_homePool.Add(this);  // straight back into the bucket it came from, no lookup
+					_homePool.Add(this); // straight back into the bucket it came from, no lookup
 
 					Interlocked.Decrement(ref _liveAllocs);
-					Interlocked.Add(ref _liveAllocSize, -_data.Length);  // data.Length is always the power-of-two bucket size
+					Interlocked.Add(ref _liveAllocSize, -_data.Length); // data.Length is always the power-of-two bucket size
 
 #if LEAK_DEBUGGING
 					_borrowedArrays.Remove(this);
@@ -176,7 +187,7 @@ namespace ReachableGames
 				}
 			}
 
-			public void IncRef()  // necessary anytime code needs to hold onto a buffer for a little while, just increment the reference counter, but remember to decref when you're done with it.
+			public void IncRef() // necessary anytime code needs to hold onto a buffer for a little while, just increment the reference counter, but remember to decref when you're done with it.
 			{
 				Interlocked.Increment(ref refCount);
 #if LEAK_DEBUGGING
@@ -188,7 +199,7 @@ namespace ReachableGames
 			{
 #if LEAK_DEBUGGING
 				long nowTicks = DateTime.Now.Ticks;
-				int count = _borrowedArrays.Count;
+				int  count    = _borrowedArrays.Count;
 				if (RGWebSocket.sCloseOutputAsync != null)
 				{
 					// Subtract one for the RGWebSocket.sCloseOutputAsync that we ignore.
@@ -243,25 +254,27 @@ namespace ReachableGames
 			void IDisposable.Dispose() { DecRef(); }
 			private PooledArray(int roundedLength, LockingList<PooledArray> homePool) { data = new byte[roundedLength]; _homePool = homePool; }
 
-			public  byte[]      data {
-				get {
+			public byte[] data
+			{
+				get
+				{
 #if LEAK_DEBUGGING
 						_interactions.Add($"Accessed at {Environment.StackTrace}");
 #endif
-						return _data!;
-					}
+					return _data!;
+				}
 				private set { _data = value; }
 			}
-			public  int         Length = 0;    // This is the requested length of the array, which is usually slightly less than data.Length (which is always power of 2)
-			private int         refCount = 0;
-			private byte[]?     _data;
-			private readonly LockingList<PooledArray> _homePool;  // the bucket this buffer belongs to, so returning it costs zero lookups
+			public           int                      Length   = 0; // This is the requested length of the array, which is usually slightly less than data.Length (which is always power of 2)
+			private          int                      refCount = 0;
+			private          byte[]?                  _data;
+			private readonly LockingList<PooledArray> _homePool; // the bucket this buffer belongs to, so returning it costs zero lookups
 
 #if LEAK_DEBUGGING
 			// Keep track of when the array was borrowed and where it was borrowed from.
-			public string        id;						// Let's us identify specific objects for loggin.
+			public  string       id; // Let's us identify specific objects for loggin.
 			private long         _borrowedAtTicks;
-			private List<string> _interactions = new List<string>();  // this allows us to track what happened and where
+			private List<string> _interactions = new List<string>(); // this allows us to track what happened and where
 #endif
 		}
 #endif
