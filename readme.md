@@ -241,11 +241,17 @@ A peer that vanishes mid-operation (closed its tab, lost its network, crashed) s
 
 ## Testing
 
-The repository contains a chat-style stress test (`ChatTest`) that spins up a server and dozens of in-process clients that broadcast, whisper, exchange binary blobs, disconnect gracefully, die abruptly, and reconnect -- then verifies that no connections or pooled buffers leak:
+The repository contains two test programs, both dependency-free console apps whose exit code is the verdict:
+
+- `UnitTests` pins down the exact contract of every primitive and server behavior: config validation, `PooledArray` refcounting and bucket math (with a multithreaded hammer), `ChannelQueue`/`LockingList`/`ThreadSafeDictionary`/`ThreadSafeHashSet` semantics under contention, histogram math, a deliberately-throwing `IDataCollection` sink, `PooledBufferWriter` validation against hostile serializers, HTTP routing precedence and response-cache policy against a real listener, disconnect-reason attribution on both ends of real websockets, the typed pipeline's strictness matrix (text/runt/unknown-id/throwing-codec all land as `ProtocolError`), and the pre-upgrade authorizer.  It also verifies that exactly one pooled buffer (the close sentinel) is live at exit.
+- `ChatTest` is the stress harness: it spins up a server and dozens of in-process clients that broadcast, whisper, exchange binary blobs, disconnect gracefully, die abruptly, and reconnect -- plus engineered phases that trip every circuit breaker -- then verifies that no connections or pooled buffers leak.
 
 ```bash
+dotnet run --project UnitTests
 dotnet run --project ChatTest -- clients=48 seed=12345
 ```
+
+`run_tests_docker.bat` builds a throwaway Linux image and runs both suites inside it (the managed `HttpListener` on Linux is a different implementation than Windows' http.sys, and it's what kubernetes pods actually run).
 
 ## Documentation
 

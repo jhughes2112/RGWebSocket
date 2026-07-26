@@ -128,10 +128,10 @@ namespace ReachableGames
 				try
 				{
 					_draining = false; // fresh start (supports Stop/Start reuse)
-										// Stop/Start reuse needs BOTH of these rebuilt, because StopListening ends them permanently: it
-										// Close()s the listener (disposed -- Prefixes/Start throw on it afterward) and Complete()s the reap
-										// queue (closed to writers forever, so every socket of the second run would be refused reaping and
-										// never disposed).  Neither can be reopened, so a reused server gets fresh ones.
+									   // Stop/Start reuse needs BOTH of these rebuilt, because StopListening ends them permanently: it
+									   // Close()s the listener (disposed -- Prefixes/Start throw on it afterward) and Complete()s the reap
+									   // queue (closed to writers forever, so every socket of the second run would be refused reaping and
+									   // never disposed).  Neither can be reopened, so a reused server gets fresh ones.
 					_listener  = new HttpListener();
 					_reapQueue = new ChannelQueue<RGWebSocket>(singleReader: true, singleWriter: false);
 					_listener.Prefixes.Add(_prefixURL);
@@ -173,9 +173,9 @@ namespace ReachableGames
 					//    graceful close frames and any in-flight receives complete against a live handle, not a freed one.
 					_logger.Log(EVerbosity.Info, "WebSocketServer.StopListening ConnectionManager.Shutdown");
 					await _connectionManager.Shutdown().ConfigureAwait(false); // app cleanup + closes the sockets IT tracks
-																				// Belt and suspenders: close any accepted socket the app did NOT track (e.g. connected but not yet in a
-																				// lobby).  EVERY accepted socket must be reaped before the handle is disposed, or its posted receive is
-																				// the one that fires OnNativeIOCompleted on a freed overlapped.  Close() is idempotent per socket.
+																			   // Belt and suspenders: close any accepted socket the app did NOT track (e.g. connected but not yet in a
+																			   // lobby).  EVERY accepted socket must be reaped before the handle is disposed, or its posted receive is
+																			   // the one that fires OnNativeIOCompleted on a freed overlapped.  Close() is idempotent per socket.
 					_liveSockets.Foreach((rgws) => rgws.Close(EDisconnectReason.LocalShutdown));
 
 					// Wait for every socket to finish DISCONNECTING and be reaped.  All THREE conditions are load-bearing:
@@ -356,8 +356,14 @@ namespace ReachableGames
 								{
 									// Actually handle the connection
 									HttpListenerContext connectContext = await connectTask.ConfigureAwait(false); // this task is already complete, so it does not block
-									Task                connectionTask = HandleConnection(connectContext);
+									Task                connectionTask = HandleConnectionObserved(connectContext);
 									listenerTasks.Add(connectionTask);
+								}
+								else if (connectTask.IsFaulted)
+								{
+									// Observe the fault: Stop() deliberately faults pending accepts, and an unobserved Task exception
+									// surfaces later as an UnobservedTaskException at GC time -- noise at best, a mystery at worst.
+									_ = connectTask.Exception;
 								}
 							}
 						}
@@ -394,6 +400,22 @@ namespace ReachableGames
 						}
 					}
 					_logger.Log(EVerbosity.Extreme, "WebSocketServer.ListenerUpdate - listener tasks dead");
+				}
+			}
+
+			//-------------------
+			// HandleConnection catches everything it EXPECTS.  This wrapper exists for what it doesn't: its task lands in
+			// ListenerUpdate's WhenAny set, where a faulted task would be removed and disposed without anyone reading its
+			// exception -- the failure would vanish into an UnobservedTaskException at GC time instead of a log line.
+			private async Task HandleConnectionObserved(HttpListenerContext httpContext)
+			{
+				try
+				{
+					await HandleConnection(httpContext).ConfigureAwait(false);
+				}
+				catch (Exception e)
+				{
+					_logger.Log(EVerbosity.Error, $"WebSocketServer.HandleConnection - unhandled exception {SafeUrl(httpContext)} {e}");
 				}
 			}
 
