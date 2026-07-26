@@ -32,8 +32,10 @@ Run `build.bat`.  It produces two **standalone, self-contained** folders under `
 
 | Folder | Contents | Drop into |
 |---|---|---|
-| `build/Server/` | `RGWebSocket.dll` + `RGWebSocket.pdb` (Core **and** Server, .NET 10) | A .NET server project — reference the DLL directly. |
-| `build/Client/` | `RGWebSocketUnity.dll` + `RGWebSocketUnity.pdb` + `System.Threading.Channels.dll` (Core only, netstandard2.1) | Unity `Assets/Plugins/`. |
+| `build/RGWebSocket.Server/` | `RGWebSocket.dll` + `RGWebSocket.pdb` (Core **and** Server, .NET 10) | A .NET server project — reference the DLL directly. |
+| `build/RGWebSocket.Client/` | `RGWebSocketUnity.dll` + `RGWebSocketUnity.pdb` + `System.Threading.Channels.dll` (Core only, netstandard2.1) | Unity `Assets/Plugins/`. |
+
+Both folders also include **`API.md`** — a self-contained API reference (quickstarts, threading contract, buffer ownership rules, config knobs, disconnect reasons, metrics) so someone can write code against the DLLs without ever seeing this repository.
 
 Pick exactly one: **clients take the Client folder, servers take the Server folder.**  There is no NuGet feed and no cross-package dependency to manage — each folder is everything that package needs.
 
@@ -45,7 +47,7 @@ Unity's BCL does not include `System.Threading.Channels`, which is why the Clien
 
 ### Option B: copy the source folders
 
-Prefer to compile the library as part of your own assembly?  Copy `RGWebSocket.Core/` (and `RGWebSocket.Server/` for servers) into your project tree — the SDK-style `**/*.cs` glob picks them up automatically.  For Unity, copy `RGWebSocket.Core/` into `Assets/` and add `System.Threading.Channels.dll` (from `build/Client/`, or the NuGet package of the same name) to `Assets/Plugins/`.
+Prefer to compile the library as part of your own assembly?  Copy `RGWebSocket.Core/` (and `RGWebSocket.Server/` for servers) into your project tree — the SDK-style `**/*.cs` glob picks them up automatically.  For Unity, copy `RGWebSocket.Core/` into `Assets/` and add `System.Threading.Channels.dll` (from `build/RGWebSocket.Client/`, or the NuGet package of the same name) to `Assets/Plugins/`.
 
 ## Usage
 

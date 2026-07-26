@@ -9,9 +9,13 @@ REM one folder wholesale. Every DLL ships with a portable .pdb that has the sour
 REM step straight into the library source from the consuming project.
 
 REM Server package: RGWebSocket.dll + .pdb (net10, Core+Server, AOT-clean). Drop into a server project.
-dotnet build RGWebSocket.csproj --no-incremental --nologo -c Release -o build\Server
+dotnet build RGWebSocket.csproj --no-incremental --nologo -c Release -o build\RGWebSocket.Server
 
 REM Client package: RGWebSocketUnity.dll + .pdb (+ System.Threading.Channels.dll). Drop into Unity Assets\Plugins.
-dotnet build RGWebSocketUnity.csproj --no-incremental --nologo -c Release -o build\Client
+dotnet build RGWebSocketUnity.csproj --no-incremental --nologo -c Release -o build\RGWebSocket.Client
+
+REM Each package ships with the API reference so consumers can code against the DLLs without the repo.
+copy /y API.md build\RGWebSocket.Server\API.md >nul
+copy /y API.md build\RGWebSocket.Client\API.md >nul
 
 pause
